@@ -41,6 +41,21 @@ app.get('/api/products', async (req, res) => {
   }
 });
 
+// --- NEW: GET all suppliers ---
+app.get('/api/suppliers', async (req, res) => {
+  try {
+      // Select relevant columns from the suppliers table
+      // Order by name or rating, for example
+      const result = await db.query('SELECT id, name, category, location, rating, image_url FROM suppliers ORDER BY name ASC');
+
+      // Send the results back as JSON
+      res.json(result.rows);
+
+  } catch (err) {
+      console.error("Error fetching suppliers:", err);
+      res.status(500).json({ error: 'Failed to fetch suppliers' });
+  }
+});
 
 // --- Start the Server ---
 app.listen(PORT, () => {
