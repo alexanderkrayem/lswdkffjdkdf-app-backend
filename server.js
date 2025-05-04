@@ -58,6 +58,182 @@ app.get('/api/suppliers', async (req, res) => {
 });
 
 // server.js
+// ... (other require statements, middleware, existing routes for products/suppliers) ...
+
+// --- NEW: User Profile API Endpoints ---
+
+// GET user profile
+// Expects userId as a query parameter, e.g., /api/user/profile?userId=12345
+app.get('/api/user/profile', async (req, res) => {
+  const { userId } = req.query;
+
+  if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+  }
+
+  try {
+      const query = 'SELECT user_id, full_name, phone_number, address_line1, address_line2, city FROM user_profiles WHERE user_id = $1';
+      const result = await db.query(query, [userId]);
+
+      if (result.rows.length > 0) {
+          res.json(result.rows[0]); // Send the profile data
+      } else {
+          res.status(404).json({ message: 'User profile not found' }); // User exists in TG but no profile saved yet
+      }
+  } catch (err) {
+      console.error(`Error fetching profile for user ${userId}:`, err);
+      res.status(500).json({ error: 'Failed to fetch user profile' });
+  }
+});
+
+// POST (Create or Update) user profile
+// Expects profile data in request body: { userId, fullName, phoneNumber, addressLine1, addressLine2, city }
+app.post('/api/user/profile', async (req, res) => {
+  const { userId, fullName, phoneNumber, addressLine1, addressLine2, city } = req.body;
+
+  // Basic validation
+  if (!userId || !addressLine1 || !city ) { // Add more required fields as needed (e.g., fullName, phoneNumber)
+      return res.status(400).json({ error: 'Missing required profile fields (userId, addressLine1, city)' });
+  }
+
+  try {
+      // Use INSERT ... ON CONFLICT to UPSERT (update if exists, insert if not)
+      const query = `
+          INSERT INTO user_profiles (user_id, full_name, phone_number, address_line1, address_line2, city)
+          VALUES ($1, $2, $3, $4, $5, $6)
+          ON CONFLICT (user_id)
+          DO UPDATE SET
+              full_name = EXCLUDED.full_name,
+              phone_number = EXCLUDED.phone_number,
+              address_line1 = EXCLUDED.address_line1,
+              address_line2 = EXCLUDED.address_line2,
+              city = EXCLUDED.city,
+              updated_at = NOW() -- Manually update updated_at or rely on trigger if created
+          RETURNING user_id, full_name, phone_number, address_line1, address_line2, city; -- Return the saved data
+      `;
+      const values = [userId, fullName, phoneNumber, addressLine1, addressLine2, city];
+      const result = await db.query(query, values);
+
+      res.status(200).json(result.rows[0]); // Send back the created/updated profile
+
+  } catch (err) {
+      console.error(`Error creating/updating profile for user ${userId}:`, err);
+      res.status(500).json({ error: 'Failed to save user profile' });
+  }
+});
+
+
+// --- NEW: Orders API Endpoint ---
+
+// POST Create a new order from user's cart
+// Expects { userId } in request body
+app.post('/api/orders', async (req, res) => {
+  const { userId } = req.body;
+
+  if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+  }
+
+  // Use a database client for transaction control
+  const client = await db.pool.connect(); // Get a client from the pool
+
+  try {
+      // --- Start Transaction ---
+      await client.query('BEGIN');
+      console.log(`Order Transaction BEGIN for user ${userId}`);
+
+      // 1. Fetch cart items and product details for the user, lock rows for update
+      // Locking ensures price/stock doesn't change between reading cart and creating order
+      // (Optional but safer for high traffic - FOR UPDATE requires careful use)
+      // Simpler approach first: just fetch current cart.
+      const cartQuery = `
+          SELECT
+              ci.product_id,
+              ci.quantity,
+              p.price,
+              p.discount_price,
+              p.is_on_sale
+          FROM cart_items ci
+          JOIN products p ON ci.product_id = p.id
+          WHERE ci.user_id = $1;
+          -- FOR UPDATE; -- Optional: If you need to lock products during checkout
+      `;
+      const cartResult = await client.query(cartQuery, [userId]);
+      const cartItems = cartResult.rows;
+
+      if (cartItems.length === 0) {
+          await client.query('ROLLBACK'); // Rollback transaction
+          console.log(`Order Transaction ROLLBACK for user ${userId} - Cart empty`);
+          return res.status(400).json({ error: 'Cart is empty, cannot create order' });
+      }
+
+      // 2. Calculate total amount and prepare order items
+      let totalAmount = 0;
+      const orderItemsData = cartItems.map(item => {
+          const priceAtOrderTime = item.is_on_sale && item.discount_price ? item.discount_price : item.price;
+          totalAmount += parseFloat(priceAtOrderTime) * item.quantity;
+          return {
+              productId: item.product_id,
+              quantity: item.quantity,
+              priceAtTimeOfOrder: priceAtOrderTime
+          };
+      });
+      console.log(`Order Calculation for user ${userId}: Total=${totalAmount}, Items=${orderItemsData.length}`);
+
+      // 3. Insert into orders table
+      const orderInsertQuery = `
+          INSERT INTO orders (user_id, total_amount, status)
+          VALUES ($1, $2, $3)
+          RETURNING id; -- Get the new order ID
+      `;
+      const orderInsertResult = await client.query(orderInsertQuery, [userId, totalAmount, 'pending']); // Default status 'pending'
+      const newOrderId = orderInsertResult.rows[0].id;
+      console.log(`Order Created for user ${userId}: OrderID=${newOrderId}`);
+
+
+      // 4. Insert into order_items table
+      // Construct a multi-row insert query for efficiency
+      const orderItemsInsertQuery = `
+          INSERT INTO order_items (order_id, product_id, quantity, price_at_time_of_order)
+          VALUES ${orderItemsData.map((_, index) => `($${index * 4 + 1}, $${index * 4 + 2}, $${index * 4 + 3}, $${index * 4 + 4})`).join(', ')}
+      `;
+      // Flatten the values array: [orderId, productId1, qty1, price1, orderId, productId2, qty2, price2, ...]
+      const orderItemsValues = orderItemsData.reduce((acc, item) => {
+          acc.push(newOrderId, item.productId, item.quantity, item.priceAtTimeOfOrder);
+          return acc;
+      }, []);
+
+      await client.query(orderItemsInsertQuery, orderItemsValues);
+       console.log(`Order Items Inserted for user ${userId}, OrderID=${newOrderId}`);
+
+      // 5. Delete items from cart_items table
+      const cartDeleteQuery = 'DELETE FROM cart_items WHERE user_id = $1';
+      await client.query(cartDeleteQuery, [userId]);
+      console.log(`Cart Cleared for user ${userId}`);
+
+      // --- Commit Transaction ---
+      await client.query('COMMIT');
+      console.log(`Order Transaction COMMIT for user ${userId}, OrderID=${newOrderId}`);
+
+      res.status(201).json({ message: 'Order created successfully', orderId: newOrderId });
+
+  } catch (err) {
+      // --- Rollback Transaction on Error ---
+      await client.query('ROLLBACK');
+      console.error(`Order Transaction ROLLBACK for user ${userId} due to error:`, err);
+      res.status(500).json({ error: 'Failed to create order' });
+  } finally {
+      // --- Release Client Back to Pool ---
+      client.release();
+       console.log(`Database client released for user ${userId} order transaction.`);
+  }
+});
+
+
+// --- Start the Server ---
+// ... (app.listen code) ...
+
+// server.js
 // ... (other require statements, middleware, existing routes) ...
 
 // --- NEW: Cart API Endpoints ---
