@@ -330,9 +330,64 @@ app.delete('/api/cart/item/:productId', async (req, res) => {
   }
 });
 
+
+
 // TODO LATER: Add PUT endpoint to specifically SET quantity (useful for +/- buttons)
 // PUT /api/cart/item/{productId} { userId, newQuantity } -> UPDATE cart_items SET quantity = newQuantity ...
+// server.js
+// ... (other require statements, middleware, existing cart routes GET, POST, DELETE) ...
 
+// --- NEW: PUT - Update quantity of a specific item in cart ---
+// Expects userId in query, productId in URL path, { newQuantity } in request body
+// e.g., PUT /api/cart/item/101?userId=12345  Body: { "newQuantity": 3 }
+app.put('/api/cart/item/:productId', async (req, res) => {
+    const userId = req.query.userId;
+    const { productId } = req.params;
+    const { newQuantity } = req.body;
+
+    if (!userId || !productId || newQuantity === undefined) {
+        return res.status(400).json({ error: 'Missing userId, productId, or newQuantity' });
+    }
+
+    const quantity = parseInt(newQuantity, 10);
+    if (isNaN(quantity) || quantity < 0) { // Allow 0 for potential removal, though DELETE is cleaner for that
+        return res.status(400).json({ error: 'Invalid newQuantity' });
+    }
+
+    // If quantity is 0, we can treat it as a delete or let the client call DELETE explicitly.
+    // For simplicity, we'll let client call DELETE if they mean to remove.
+    // If you want this PUT to handle removal with quantity 0, add that logic here.
+    if (quantity === 0) {
+         // Option 1: Error out and tell client to use DELETE
+         return res.status(400).json({ error: 'Use DELETE endpoint to remove items (quantity cannot be 0 via PUT)'});
+         // Option 2: Perform a delete (less RESTful for a PUT, but possible)
+         // const deleteQuery = 'DELETE FROM cart_items WHERE user_id = $1 AND product_id = $2 RETURNING *;';
+         // ... handle delete ...
+    }
+
+
+    try {
+        const query = `
+            UPDATE cart_items
+            SET quantity = $3, added_at = NOW()
+            WHERE user_id = $1 AND product_id = $2
+            RETURNING *;
+        `;
+        const result = await db.query(query, [userId, productId, quantity]);
+
+        if (result.rowCount > 0) {
+            res.status(200).json(result.rows[0]); // Send back the updated cart item
+        } else {
+            res.status(404).json({ error: 'Item not found in cart for this user to update' });
+        }
+    } catch (err) {
+        console.error(`Error updating cart item quantity for user ${userId}:`, err);
+        res.status(500).json({ error: 'Failed to update cart item quantity' });
+    }
+});
+
+
+// ... (rest of server.js, app.listen)
 
 // --- Start the Server ---
 // ... (app.listen code) ...
