@@ -386,6 +386,79 @@ app.put('/api/cart/item/:productId', async (req, res) => {
     }
 });
 
+// --- NEW: Favorites API Endpoints ---
+
+// GET user's favorite product IDs
+// Expects userId as a query parameter, e.g., /api/favorites?userId=12345
+app.get('/api/favorites', async (req, res) => {
+    const { userId } = req.query;
+
+    if (!userId) {
+        return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    try {
+        // Select only the product_id for efficiency if that's all the frontend needs initially
+        const query = 'SELECT product_id FROM user_favorites WHERE user_id = $1 ORDER BY added_at DESC';
+        const result = await db.query(query, [userId]);
+        // Send an array of product_id values
+        res.json(result.rows.map(row => row.product_id));
+    } catch (err) {
+        console.error(`Error fetching favorites for user ${userId}:`, err);
+        res.status(500).json({ error: 'Failed to fetch favorites' });
+    }
+});
+
+// POST - Add a product to user's favorites
+// Expects { userId, productId } in request body
+app.post('/api/favorites', async (req, res) => {
+    const { userId, productId } = req.body;
+
+    if (!userId || !productId) {
+        return res.status(400).json({ error: 'User ID and Product ID are required' });
+    }
+
+    try {
+        // Attempt to insert. If it violates PRIMARY KEY (user_id, product_id), it means it's already a favorite.
+        const query = 'INSERT INTO user_favorites (user_id, product_id) VALUES ($1, $2) RETURNING *';
+        const result = await db.query(query, [userId, productId]);
+        res.status(201).json({ message: 'Product added to favorites', favorite: result.rows[0] });
+    } catch (err) {
+        if (err.code === '23505') { // Unique violation error code in PostgreSQL
+            return res.status(409).json({ error: 'Product already in favorites' }); // 409 Conflict
+        }
+        console.error(`Error adding favorite for user ${userId}, product ${productId}:`, err);
+        res.status(500).json({ error: 'Failed to add favorite' });
+    }
+});
+
+// DELETE - Remove a product from user's favorites
+// Expects userId in query, productId in URL path e.g., /api/favorites/101?userId=12345
+// OR { userId, productId } in request body (choose one style and stick to it)
+// Let's use query params for consistency with GET, and productId in path for RESTfulness.
+app.delete('/api/favorites/:productId', async (req, res) => {
+    const { userId } = req.query;
+    const { productId } = req.params;
+
+    if (!userId || !productId) {
+        return res.status(400).json({ error: 'User ID and Product ID are required' });
+    }
+
+    try {
+        const query = 'DELETE FROM user_favorites WHERE user_id = $1 AND product_id = $2 RETURNING *';
+        const result = await db.query(query, [userId, productId]);
+
+        if (result.rowCount > 0) {
+            res.status(200).json({ message: 'Product removed from favorites', removed: result.rows[0] });
+        } else {
+            // Not an error if trying to delete something not favorited, just wasn't there.
+            res.status(404).json({ message: 'Favorite not found to remove' });
+        }
+    } catch (err) {
+        console.error(`Error removing favorite for user ${userId}, product ${productId}:`, err);
+        res.status(500).json({ error: 'Failed to remove favorite' });
+    }
+});
 
 // ... (rest of server.js, app.listen)
 
