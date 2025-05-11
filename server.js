@@ -23,23 +23,74 @@ app.get('/', (req, res) => {
   res.send('Hello from Telegram App Backend!');
 });
 
-// GET all products
-app.get('/api/products', async (req, res) => {
-  try {
-    // Select all columns from the products table
-    // Optional: Order by creation date or name
-    const result = await db.query('SELECT * FROM products ORDER BY created_at DESC');
+// GET all products (NOW WITH PAGINATION)
+app.get('/api/products', async (req, res) => { // Route handler starts
 
-    // Send the results back as JSON
-    // result.rows contains an array of product objects
-    res.json(result.rows);
+    // Default values for pagination
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 20;
 
-  } catch (err) {
-    console.error("Error fetching products:", err);
-    // Send a generic error message to the client
-    res.status(500).json({ error: 'Failed to fetch products' });
-  }
-});
+    // Ensure page and limit are positive
+    const safePage = Math.max(1, page);
+    const safeLimit = Math.max(1, limit);
+
+    const offset = (safePage - 1) * safeLimit;
+
+    // TODO LATER: Variables for searchTerm, category, sortBy will be extracted from req.query here
+
+    try { // Single try block for the entire operation
+        // --- Query to get the paginated items ---
+        let itemsQuery = 'SELECT * FROM products'; // Base query
+        const queryParams = []; // Will hold values for $1, $2, etc.
+        let paramCount = 0; // To keep track of parameter numbers $1, $2...
+
+        // --- LATER: WHERE clauses for search and filters will be built here ---
+        // Example of how a filter might be added:
+        // if (req.query.category) {
+        //     itemsQuery += (paramCount === 0 ? ' WHERE' : ' AND') + ` category = $${++paramCount}`;
+        //     queryParams.push(req.query.category);
+        // }
+
+        itemsQuery += ' ORDER BY created_at DESC'; // Default sort order
+        itemsQuery += ` LIMIT $${++paramCount} OFFSET $${++paramCount}`;
+        queryParams.push(safeLimit, offset);
+
+        // console.log("Executing itemsQuery:", itemsQuery, "with params:", queryParams);
+        const itemsResult = await db.query(itemsQuery, queryParams);
+        const products = itemsResult.rows;
+
+        // --- Query to get the total count of items (for totalPages calculation) ---
+        // This count MUST reflect any filters applied to itemsQuery for accuracy
+        let countQuery = 'SELECT COUNT(*) AS total_items FROM products';
+        const countQueryParams = []; // Will hold values for $1, $2 for the count query
+        let countParamCount = 0; // Separate counter for count query params
+
+        // --- LATER: The SAME WHERE clauses for search and filters MUST be built here ---
+        // Example corresponding to category filter above:
+        // if (req.query.category) {
+        //     countQuery += (countParamCount === 0 ? ' WHERE' : ' AND') + ` category = $${++countParamCount}`;
+        //     countQueryParams.push(req.query.category);
+        // }
+
+        // console.log("Executing countQuery:", countQuery, "with params:", countQueryParams);
+        const countResult = await db.query(countQuery, countQueryParams);
+        const totalItems = parseInt(countResult.rows[0].total_items, 10);
+        const totalPages = Math.ceil(totalItems / safeLimit);
+
+        // Send the single, final paginated response
+        res.json({
+            items: products,
+            currentPage: safePage,
+            totalPages: totalPages,
+            totalItems: totalItems,
+            limit: safeLimit
+        });
+
+    } catch (err) { // Single catch block for any error within the try
+        console.error("Error fetching products with pagination:", err);
+        res.status(500).json({ error: 'Failed to fetch products' });
+    }
+}); // Route handler ends
 
 // --- NEW: GET all suppliers ---
 app.get('/api/suppliers', async (req, res) => {
