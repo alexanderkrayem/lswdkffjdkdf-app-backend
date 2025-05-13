@@ -23,6 +23,104 @@ app.get('/', (req, res) => {
   res.send('Hello from Telegram App Backend!');
 });
 
+// server.js
+// ... (other require statements, middleware, existing routes for products, suppliers, cart, profile, orders, favorites) ...
+
+// --- NEW: Global Search API Endpoint ---
+
+// GET /api/search?searchTerm=...
+app.get('/api/search', async (req, res) => {
+    const searchTerm = req.query.searchTerm || '';
+    const MIN_SEARCH_LENGTH = 3; // Minimum length to trigger search
+
+    if (searchTerm.trim().length < MIN_SEARCH_LENGTH) {
+        return res.json({
+            searchTerm: searchTerm,
+            results: { products: [], deals: [], suppliers: [] },
+            message: `Search term must be at least ${MIN_SEARCH_LENGTH} characters.`
+        });
+    }
+
+    // Define limits for each category in the results (can be adjusted)
+    const RESULT_LIMIT_PER_CATEGORY = 10;
+
+    // Use 'websearch_to_tsquery' for more flexible user input parsing
+    const ftsQueryString = `websearch_to_tsquery('pg_catalog.arabic', $1)`;
+    // Parameter for trigram similarity threshold
+    const trigramThreshold = 0.25; // Adjust this threshold based on testing (0.0 to 1.0)
+
+    try {
+        // --- Search Products ---
+        const productsQuery = `
+            SELECT
+                p.id, p.name, p.category, p.price, p.discount_price, p.is_on_sale, p.image_url, -- Select needed fields
+                ts_rank_cd(p.tsv, query) AS rank -- FTS rank
+                -- similarity(p.name, $1) AS name_sim -- Optionally calculate similarity
+            FROM products p, ${ftsQueryString} query
+            WHERE p.tsv @@ query OR similarity(p.name, $1) > $2 -- FTS match OR name similarity
+            ORDER BY
+                 CASE WHEN p.tsv @@ query THEN 0 ELSE 1 END, -- FTS matches first
+                 ts_rank_cd(p.tsv, query) DESC,             -- Then by FTS rank
+                 similarity(p.name, $1) DESC,               -- Then by name similarity
+                 p.created_at DESC                           -- Finally by date
+            LIMIT $3;
+        `;
+        const productsResult = await db.query(productsQuery, [searchTerm.trim(), trigramThreshold, RESULT_LIMIT_PER_CATEGORY]);
+
+        // --- Search Deals ---
+        const dealsQuery = `
+            SELECT
+                d.id, d.title, d.description, d.image_url, -- Select needed fields
+                ts_rank_cd(d.tsv, query) AS rank
+            FROM deals d, ${ftsQueryString} query
+            WHERE d.is_active = TRUE AND (d.tsv @@ query OR similarity(d.title, $1) > $2)
+            ORDER BY
+                CASE WHEN d.tsv @@ query THEN 0 ELSE 1 END,
+                ts_rank_cd(d.tsv, query) DESC,
+                similarity(d.title, $1) DESC,
+                d.created_at DESC
+            LIMIT $3;
+        `;
+        const dealsResult = await db.query(dealsQuery, [searchTerm.trim(), trigramThreshold, RESULT_LIMIT_PER_CATEGORY]);
+
+        // --- Search Suppliers ---
+        const suppliersQuery = `
+            SELECT
+                s.id, s.name, s.category, s.location, s.rating, s.image_url, -- Select needed fields
+                ts_rank_cd(s.tsv, query) AS rank
+            FROM suppliers s, ${ftsQueryString} query
+            WHERE s.tsv @@ query OR similarity(s.name, $1) > $2
+            ORDER BY
+                CASE WHEN s.tsv @@ query THEN 0 ELSE 1 END,
+                ts_rank_cd(s.tsv, query) DESC,
+                similarity(s.name, $1) DESC,
+                s.id -- Tie breaker
+            LIMIT $3;
+        `;
+        const suppliersResult = await db.query(suppliersQuery, [searchTerm.trim(), trigramThreshold, RESULT_LIMIT_PER_CATEGORY]);
+
+        // --- Combine Results ---
+        res.json({
+            searchTerm: searchTerm,
+            results: {
+                products: productsResult.rows,
+                deals: dealsResult.rows,
+                suppliers: suppliersResult.rows
+            }
+        });
+
+    } catch (err) {
+        console.error(`Error during global search for term "${searchTerm}":`, err);
+        // Handle specific errors like invalid tsquery syntax if needed
+        if (err.message.includes("syntax error in tsquery")) {
+             return res.status(400).json({ error: 'Invalid search query format. Please try different terms.' });
+        }
+        res.status(500).json({ error: 'Failed to perform search' });
+    }
+});
+
+// ... (rest of server.js, app.listen) ...
+
 // GET all products (NOW WITH PAGINATION)
 app.get('/api/products', async (req, res) => { // Route handler starts
 
