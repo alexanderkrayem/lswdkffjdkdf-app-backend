@@ -217,6 +217,55 @@ app.get('/api/products', async (req, res) => { // Route handler starts
         res.status(500).json({ error: 'Failed to fetch products' });
     }
 }); // Route handler ends
+// server.js
+// ... (other require statements, middleware, existing /api/products route) ...
+
+// --- NEW: GET a single product by ID ---
+// e.g., /api/products/123
+app.get('/api/products/:productId', async (req, res) => {
+    const { productId } = req.params; // Get productId from URL parameters
+
+    // Validate if productId is a number (basic validation)
+    if (isNaN(parseInt(productId, 10))) {
+        return res.status(400).json({ error: 'Invalid Product ID format.' });
+    }
+
+    try {
+        const query = `
+            SELECT 
+                p.id, 
+                p.name, 
+                p.description, 
+                p.price, 
+                p.discount_price, 
+                p.category, 
+                p.image_url, 
+                p.is_on_sale, 
+                p.stock_level, 
+                p.created_at,
+                p.supplier_id, 
+                s.name AS supplier_name,  -- Include supplier's name
+                s.location AS supplier_location -- Optionally include supplier's location
+                -- Add any other product fields you need for the detail view
+            FROM products p
+            LEFT JOIN suppliers s ON p.supplier_id = s.id -- LEFT JOIN to still get product if supplier is missing (though unlikely with FKs)
+            WHERE p.id = $1;
+        `;
+        // Parameterized query to prevent SQL injection
+        const result = await db.query(query, [productId]);
+
+        if (result.rows.length > 0) {
+            res.json(result.rows[0]); // Send the first (and should be only) product found
+        } else {
+            res.status(404).json({ error: 'Product not found' }); // No product with that ID
+        }
+    } catch (err) {
+        console.error(`Error fetching product with ID ${productId}:`, err);
+        res.status(500).json({ error: 'Failed to fetch product details' });
+    }
+});
+
+// ... (other routes, app.listen) ...
 
 // --- NEW: GET all suppliers ---
 app.get('/api/suppliers', async (req, res) => {
