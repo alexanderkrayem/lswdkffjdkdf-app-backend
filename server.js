@@ -120,7 +120,35 @@ app.get('/api/search', async (req, res) => {
 });
 
 // ... (rest of server.js, app.listen) ...
+// telegram-app-backend/server.js
+// ... (other require statements, middleware, existing routes) ...
 
+// --- NEW: GET all active deals ---
+app.get('/api/deals', async (req, res) => {
+    try {
+        // Fetch deals, maybe filter by is_active = TRUE and order by end_date or created_at
+        const query = `
+            SELECT 
+                id, title, description, discount_percentage, 
+                start_date, end_date, product_id, supplier_id, image_url, 
+                is_active, created_at 
+                -- You might want to join with products/suppliers to get their names for display
+                -- For example: p.name as product_name, s.name as supplier_name
+            FROM deals 
+            WHERE is_active = TRUE 
+            -- AND (end_date IS NULL OR end_date >= CURRENT_DATE) -- Optionally filter out expired deals
+            ORDER BY created_at DESC; 
+            -- Or ORDER BY end_date ASC;
+        `;
+        const result = await db.query(query);
+        res.json(result.rows);
+    } catch (err) {
+        console.error("Error fetching deals:", err);
+        res.status(500).json({ error: 'Failed to fetch deals' });
+    }
+});
+
+// ... (rest of server.js) ...
 // GET all products (NOW WITH PAGINATION)
 app.get('/api/products', async (req, res) => { // Route handler starts
 
