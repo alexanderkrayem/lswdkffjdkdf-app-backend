@@ -219,7 +219,66 @@ app.get('/api/products', async (req, res) => { // Route handler starts
 }); // Route handler ends
 // server.js
 // ... (other require statements, middleware, existing /api/products route) ...
+// server.js
+// ... (other require statements, middleware, existing routes) ...
 
+// --- NEW: GET multiple products by a list of IDs ---
+// Expects a comma-separated string of product IDs in a query parameter
+// e.g., /api/products/batch?ids=1,2,3,4
+app.get('/api/products/batch', async (req, res) => {
+    const idsString = req.query.ids;
+
+    if (!idsString) {
+        return res.status(400).json({ error: 'Product IDs are required.' });
+    }
+
+    // Convert comma-separated string to an array of integers
+    const productIds = idsString.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id) && id > 0);
+
+    if (productIds.length === 0) {
+        return res.status(400).json({ error: 'No valid Product IDs provided.' });
+    }
+
+    try {
+        // Using ANY($1) with an array of IDs is efficient
+        // We also want to join with suppliers to get supplier_name, similar to single product detail
+        const query = `
+            SELECT 
+                p.id, 
+                p.name, 
+                p.description, 
+                p.price, 
+                p.discount_price, 
+                p.category, 
+                p.image_url, 
+                p.is_on_sale, 
+                p.stock_level, 
+                p.created_at,
+                p.supplier_id,
+                s.name AS supplier_name 
+            FROM products p
+            LEFT JOIN suppliers s ON p.supplier_id = s.id
+            WHERE p.id = ANY($1::int[]); 
+            -- Optionally, preserve order of IDs if needed (more complex query or client-side sort)
+            -- For now, default database order for the matched IDs
+        `;
+        // $1::int[] tells PostgreSQL to treat the parameter as an array of integers.
+
+        const result = await db.query(query, [productIds]);
+
+        // The database might not return products in the same order as the input IDs.
+        // If order preservation is critical, you'd need to re-order them client-side
+        // or use a more complex SQL query with array_position or a JOIN with VALUES.
+        // For now, this is simpler.
+        res.json(result.rows);
+
+    } catch (err) {
+        console.error('Error fetching products by batch:', err);
+        res.status(500).json({ error: 'Failed to fetch products by batch' });
+    }
+});
+
+// ... (rest of server.js, app.listen) ...
 // --- NEW: GET a single product by ID ---
 // e.g., /api/products/123
 app.get('/api/products/:productId', async (req, res) => {
