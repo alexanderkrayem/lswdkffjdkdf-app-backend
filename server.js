@@ -514,7 +514,88 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
+// telegram-app-backend/server.js
+// ... (other require statements, middleware, existing routes including POST /api/orders) ...
 
+// telegram-app-backend/server.js
+// Replace the existing GET /api/orders route with this:
+
+app.get('/api/orders', async (req, res) => {
+    const { userId } = req.query;
+
+    if (!userId) {
+        return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    try {
+        // 1. Fetch all orders for the user
+        const ordersQuery = `
+            SELECT 
+                id, 
+                user_id, 
+                total_amount, 
+                status, 
+                order_date
+            FROM orders
+            WHERE user_id = $1
+            ORDER BY order_date DESC;
+        `;
+        const ordersResult = await db.query(ordersQuery, [userId]);
+        const userOrders = ordersResult.rows;
+
+        if (userOrders.length === 0) {
+            return res.json([]); // Return empty array if no orders found
+        }
+
+        // 2. Get all order IDs from the fetched orders
+        const orderIds = userOrders.map(order => order.id);
+
+        // 3. Fetch all order items for these order IDs in a single query
+        const orderItemsQuery = `
+            SELECT 
+                oi.order_id, -- Crucial for grouping
+                oi.product_id, 
+                oi.quantity, 
+                oi.price_at_time_of_order,
+                p.name AS product_name,
+                p.image_url AS product_image_url
+            FROM order_items oi
+            JOIN products p ON oi.product_id = p.id
+            WHERE oi.order_id = ANY($1::int[]); -- Use ANY to match multiple order IDs
+        `;
+        const allOrderItemsResult = await db.query(orderItemsQuery, [orderIds]);
+        const allOrderItems = allOrderItemsResult.rows;
+
+        // 4. Group order items by order_id (client-side)
+        const itemsByOrderId = allOrderItems.reduce((acc, item) => {
+            if (!acc[item.order_id]) {
+                acc[item.order_id] = [];
+            }
+            acc[item.order_id].push({
+                product_id: item.product_id,
+                quantity: item.quantity,
+                price_at_time_of_order: item.price_at_time_of_order,
+                product_name: item.product_name,
+                product_image_url: item.product_image_url
+            });
+            return acc;
+        }, {});
+
+        // 5. Combine orders with their grouped items
+        const ordersWithItems = userOrders.map(order => ({
+            ...order,
+            items: itemsByOrderId[order.id] || [] // Ensure 'items' is always an array
+        }));
+
+        res.json(ordersWithItems);
+
+    } catch (err) {
+        console.error(`Error fetching orders for user ${userId}:`, err);
+        res.status(500).json({ error: 'Failed to fetch order history' });
+    }
+});
+
+// ... (rest of server.js, app.listen) ...
 // --- Start the Server ---
 // ... (app.listen code) ...
 
