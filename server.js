@@ -28,82 +28,168 @@ app.get('/', (req, res) => {
 
 // --- NEW: Global Search API Endpoint ---
 
-// GET /api/search?searchTerm=...
+// server.js
+// ... (other require statements, middleware, existing routes) ...
+
 app.get('/api/search', async (req, res) => {
     const searchTerm = req.query.searchTerm || '';
-    const MIN_SEARCH_LENGTH = 3; // Minimum length to trigger search
+    const MIN_SEARCH_LENGTH = 3;
+    const DEFAULT_RESULTS_LIMIT = 10; // Default limit for deals & suppliers, and products if no pagination params
 
-    if (searchTerm.trim().length < MIN_SEARCH_LENGTH) {
+    // Filters primarily for products
+    const categoryFilter = req.query.category || '';
+    const supplierIdFilter = parseInt(req.query.supplierId, 10) || null;
+    const minPriceFilter = parseFloat(req.query.minPrice) || null;
+    const maxPriceFilter = parseFloat(req.query.maxPrice) || null;
+    const sortBy = req.query.sortBy || 'relevance'; // Default sort for products
+
+    // Pagination for product results when filters are active or explicitly requested
+    const productPage = parseInt(req.query.page, 10) || 1;
+    const productLimit = parseInt(req.query.limit, 10) || DEFAULT_RESULTS_LIMIT;
+    const safeProductPage = Math.max(1, productPage);
+    const safeProductLimit = Math.max(1, productLimit);
+    const productOffset = (safeProductPage - 1) * safeProductLimit;
+
+    if (searchTerm.trim().length < MIN_SEARCH_LENGTH && !categoryFilter && !supplierIdFilter && !minPriceFilter && !maxPriceFilter) {
         return res.json({
             searchTerm: searchTerm,
-            results: { products: [], deals: [], suppliers: [] },
-            message: `Search term must be at least ${MIN_SEARCH_LENGTH} characters.`
+            results: {
+                products: { items: [], currentPage: 1, totalPages: 0, totalItems: 0, limit: safeProductLimit }, // Add pagination structure
+                deals: [],
+                suppliers: []
+            },
+            message: `Search term or filters required. Search term must be at least ${MIN_SEARCH_LENGTH} characters.`
         });
     }
 
-    // Define limits for each category in the results (can be adjusted)
-    const RESULT_LIMIT_PER_CATEGORY = 10;
-
-    // Use 'websearch_to_tsquery' for more flexible user input parsing
-    const ftsQueryString = `websearch_to_tsquery('pg_catalog.arabic', $1)`;
-    // Parameter for trigram similarity threshold
-    const trigramThreshold = 0.25; // Adjust this threshold based on testing (0.0 to 1.0)
+    const ftsQueryString = `websearch_to_tsquery('pg_catalog.arabic', $1)`; // $1 will be searchTerm
+    const trigramThreshold = 0.25;
 
     try {
-        // --- Search Products ---
-        const productsQuery = `
+        // --- Dynamic Product Search with Filters and Pagination ---
+        let productsQuery = `
             SELECT
-                p.id, p.name, p.category, p.price, p.discount_price, p.is_on_sale, p.image_url, -- Select needed fields
-                ts_rank_cd(p.tsv, query) AS rank -- FTS rank
-                -- similarity(p.name, $1) AS name_sim -- Optionally calculate similarity
-            FROM products p, ${ftsQueryString} query
-            WHERE p.tsv @@ query OR similarity(p.name, $1) > $2 -- FTS match OR name similarity
-            ORDER BY
-                 CASE WHEN p.tsv @@ query THEN 0 ELSE 1 END, -- FTS matches first
-                 ts_rank_cd(p.tsv, query) DESC,             -- Then by FTS rank
-                 similarity(p.name, $1) DESC,               -- Then by name similarity
-                 p.created_at DESC                           -- Finally by date
-            LIMIT $3;
+                p.id, p.name, p.category, p.price, p.discount_price, p.is_on_sale, p.image_url, p.supplier_id, s.name as supplier_name
+                ${searchTerm.trim() ? `, ts_rank_cd(p.tsv, product_fts_query.query) AS rank` : ''}
+            FROM products p
+            LEFT JOIN suppliers s ON p.supplier_id = s.id
+            ${searchTerm.trim() ? `, LATERAL ${ftsQueryString} AS product_fts_query(query)` : ''}
         `;
-        const productsResult = await db.query(productsQuery, [searchTerm.trim(), trigramThreshold, RESULT_LIMIT_PER_CATEGORY]);
+        let productCountQuery = `SELECT COUNT(DISTINCT p.id) AS total_items FROM products p ${searchTerm.trim() ? `, LATERAL ${ftsQueryString} AS product_fts_query(query)` : ''}`;
 
-        // --- Search Deals ---
-        const dealsQuery = `
-            SELECT
-                d.id, d.title, d.description, d.image_url, -- Select needed fields
-                ts_rank_cd(d.tsv, query) AS rank
-            FROM deals d, ${ftsQueryString} query
-            WHERE d.is_active = TRUE AND (d.tsv @@ query OR similarity(d.title, $1) > $2)
-            ORDER BY
-                CASE WHEN d.tsv @@ query THEN 0 ELSE 1 END,
-                ts_rank_cd(d.tsv, query) DESC,
-                similarity(d.title, $1) DESC,
-                d.created_at DESC
-            LIMIT $3;
-        `;
-        const dealsResult = await db.query(dealsQuery, [searchTerm.trim(), trigramThreshold, RESULT_LIMIT_PER_CATEGORY]);
+        const productWhereClauses = [];
+        const productQueryParams = [];
+        let productParamCount = 0;
 
-        // --- Search Suppliers ---
-        const suppliersQuery = `
-            SELECT
-                s.id, s.name, s.category, s.location, s.rating, s.image_url, -- Select needed fields
-                ts_rank_cd(s.tsv, query) AS rank
-            FROM suppliers s, ${ftsQueryString} query
-            WHERE s.tsv @@ query OR similarity(s.name, $1) > $2
-            ORDER BY
-                CASE WHEN s.tsv @@ query THEN 0 ELSE 1 END,
-                ts_rank_cd(s.tsv, query) DESC,
-                similarity(s.name, $1) DESC,
-                s.id -- Tie breaker
-            LIMIT $3;
-        `;
-        const suppliersResult = await db.query(suppliersQuery, [searchTerm.trim(), trigramThreshold, RESULT_LIMIT_PER_CATEGORY]);
+        if (searchTerm.trim()) {
+            productQueryParams.push(searchTerm.trim()); // For ftsQueryString $1 and similarity $1
+            productWhereClauses.push(`(p.tsv @@ product_fts_query.query OR similarity(p.name, $${productParamCount + 1}) > $${productParamCount + 2})`);
+            productQueryParams.push(trigramThreshold); // For similarity $2
+            productParamCount = 2; // We've used $1 and $2 for searchTerm and threshold
+        }
 
-        // --- Combine Results ---
+        if (categoryFilter) {
+            productWhereClauses.push(`p.category ILIKE $${++productParamCount}`);
+            productQueryParams.push(`%${categoryFilter}%`);
+        }
+        if (supplierIdFilter) {
+            productWhereClauses.push(`p.supplier_id = $${++productParamCount}`);
+            productQueryParams.push(supplierIdFilter);
+        }
+        if (minPriceFilter !== null) {
+            productWhereClauses.push(`(CASE WHEN p.is_on_sale AND p.discount_price IS NOT NULL THEN p.discount_price ELSE p.price END) >= $${++productParamCount}`);
+            productQueryParams.push(minPriceFilter);
+        }
+        if (maxPriceFilter !== null) {
+            productWhereClauses.push(`(CASE WHEN p.is_on_sale AND p.discount_price IS NOT NULL THEN p.discount_price ELSE p.price END) <= $${++productParamCount}`);
+            productQueryParams.push(maxPriceFilter);
+        }
+
+        if (productWhereClauses.length > 0) {
+            const whereString = ' WHERE ' + productWhereClauses.join(' AND ');
+            productsQuery += whereString;
+            productCountQuery += whereString;
+        }
+
+        // Product Sorting Logic
+        let productOrderBy = '';
+        if (sortBy === 'price_asc') {
+            productOrderBy = ' ORDER BY (CASE WHEN p.is_on_sale AND p.discount_price IS NOT NULL THEN p.discount_price ELSE p.price END) ASC, p.created_at DESC';
+        } else if (sortBy === 'price_desc') {
+            productOrderBy = ' ORDER BY (CASE WHEN p.is_on_sale AND p.discount_price IS NOT NULL THEN p.discount_price ELSE p.price END) DESC, p.created_at DESC';
+        } else if (sortBy === 'newest') {
+            productOrderBy = ' ORDER BY p.created_at DESC';
+        } else { // Default to relevance if searchTerm is present, otherwise newest
+            if (searchTerm.trim()) {
+                productOrderBy = ` ORDER BY CASE WHEN p.tsv @@ product_fts_query.query THEN 0 ELSE 1 END, ts_rank_cd(p.tsv, product_fts_query.query) DESC, similarity(p.name, $1) DESC, p.created_at DESC`;
+            } else {
+                productOrderBy = ' ORDER BY p.created_at DESC';
+            }
+        }
+        productsQuery += productOrderBy;
+
+        // Add pagination to product query
+        productsQuery += ` LIMIT $${++productParamCount} OFFSET $${++productParamCount}`;
+        productQueryParams.push(safeProductLimit, productOffset);
+        
+        // Final parameters for productCountQuery (only filter params)
+        const productCountQueryParams = productQueryParams.slice(0, productQueryParams.length - 2); // Exclude limit & offset
+
+        console.log("Product Query:", productsQuery, productQueryParams);
+        console.log("Product Count Query:", productCountQuery, productCountQueryParams);
+
+        const productsResult = await db.query(productsQuery, productQueryParams);
+        const productCountResult = await db.query(productCountQuery, productCountQueryParams);
+        const totalProductItems = parseInt(productCountResult.rows[0].total_items, 10);
+        const totalProductPages = Math.ceil(totalProductItems / safeProductLimit);
+
+        const paginatedProducts = {
+            items: productsResult.rows,
+            currentPage: safeProductPage,
+            totalPages: totalProductPages,
+            totalItems: totalProductItems,
+            limit: safeProductLimit
+        };
+
+        // --- Search Deals (keeps its simpler limit, no advanced filters for now) ---
+        let dealsResult = { rows: [] };
+        if (searchTerm.trim()) { // Only search deals if there's a search term
+            const dealsQuery = `
+                SELECT d.id, d.title, d.description, d.image_url, ts_rank_cd(d.tsv, query) AS rank
+                FROM deals d, ${ftsQueryString} query
+                WHERE d.is_active = TRUE AND (d.tsv @@ query OR similarity(d.title, $1) > $2)
+                ORDER BY CASE WHEN d.tsv @@ query THEN 0 ELSE 1 END, ts_rank_cd(d.tsv, query) DESC, similarity(d.title, $1) DESC, d.created_at DESC
+                LIMIT $3;
+            `;
+            dealsResult = await db.query(dealsQuery, [searchTerm.trim(), trigramThreshold, DEFAULT_RESULTS_LIMIT]);
+        }
+
+        // --- Search Suppliers (keeps its simpler limit, no advanced filters for now) ---
+        let suppliersResult = { rows: [] };
+        if (searchTerm.trim()) { // Only search suppliers if there's a search term
+            const suppliersQuery = `
+                SELECT s.id, s.name, s.category, s.location, s.rating, s.image_url, ts_rank_cd(s.tsv, query) AS rank
+                FROM suppliers s, ${ftsQueryString} query
+                WHERE s.tsv @@ query OR similarity(s.name, $1) > $2
+                ORDER BY CASE WHEN s.tsv @@ query THEN 0 ELSE 1 END, ts_rank_cd(s.tsv, query) DESC, similarity(s.name, $1) DESC, s.id
+                LIMIT $3;
+            `;
+            suppliersResult = await db.query(suppliersQuery, [searchTerm.trim(), trigramThreshold, DEFAULT_RESULTS_LIMIT]);
+        }
+
         res.json({
             searchTerm: searchTerm,
+            filters: { // Echo back applied filters
+                category: categoryFilter,
+                supplierId: supplierIdFilter,
+                minPrice: minPriceFilter,
+                maxPrice: maxPriceFilter,
+                sortBy: sortBy,
+                page: safeProductPage,
+                limit: safeProductLimit
+            },
             results: {
-                products: productsResult.rows,
+                products: paginatedProducts, // Products now have pagination structure
                 deals: dealsResult.rows,
                 suppliers: suppliersResult.rows
             }
@@ -111,9 +197,8 @@ app.get('/api/search', async (req, res) => {
 
     } catch (err) {
         console.error(`Error during global search for term "${searchTerm}":`, err);
-        // Handle specific errors like invalid tsquery syntax if needed
         if (err.message.includes("syntax error in tsquery")) {
-             return res.status(400).json({ error: 'Invalid search query format. Please try different terms.' });
+             return res.status(400).json({ error: 'Invalid search query format.' });
         }
         res.status(500).json({ error: 'Failed to perform search' });
     }
