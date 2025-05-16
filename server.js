@@ -23,6 +23,16 @@ app.get('/', (req, res) => {
   res.send('Hello from Telegram App Backend!');
 });
 
+// In telegram-app-backend/server.js
+app.get('/api/categories', async (req, res) => {
+    try {
+        const result = await db.query('SELECT DISTINCT category FROM products WHERE category IS NOT NULL AND category != \'\' ORDER BY category ASC');
+        res.json(result.rows.map(row => row.category)); // Returns an array of category strings
+    } catch (err) {
+        console.error("Error fetching categories:", err);
+        res.status(500).json({ error: 'Failed to fetch categories' });
+    }
+});
 // server.js
 // ... (other require statements, middleware, existing routes for products, suppliers, cart, profile, orders, favorites) ...
 
