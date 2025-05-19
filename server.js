@@ -73,7 +73,7 @@ app.get('/api/search', async (req, res) => {
     }
 
     const ftsQueryString = `websearch_to_tsquery('pg_catalog.arabic', $1)`; // $1 will be searchTerm
-    const trigramThreshold = 0.25;
+    const trigramThreshold = 0.1;
 
     try {
         // --- Dynamic Product Search with Filters and Pagination ---
