@@ -242,7 +242,55 @@ app.get('/api/deals', async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch deals' });
     }
 });
+// server.js
+// ... (other require statements, middleware, existing /api/deals route) ...
 
+// --- NEW: GET a single deal by ID ---
+// e.g., /api/deals/123
+app.get('/api/deals/:dealId', async (req, res) => {
+    const { dealId } = req.params;
+
+    if (isNaN(parseInt(dealId, 10))) {
+        return res.status(400).json({ error: 'Invalid Deal ID format.' });
+    }
+
+    try {
+        // Query to fetch the deal and potentially linked product/supplier names
+        const query = `
+            SELECT 
+                d.id, 
+                d.title, 
+                d.description, 
+                d.discount_percentage, 
+                d.start_date, 
+                d.end_date, 
+                d.product_id, 
+                p.name AS product_name, -- Name of the linked product
+                p.image_url AS product_image_url, -- Image of the linked product
+                d.supplier_id,
+                s.name AS supplier_name, -- Name of the linked supplier
+                d.image_url, 
+                d.is_active, 
+                d.created_at
+            FROM deals d
+            LEFT JOIN products p ON d.product_id = p.id       -- Join to get linked product's name/image
+            LEFT JOIN suppliers s ON d.supplier_id = s.id    -- Join to get linked supplier's name
+            WHERE d.id = $1 AND d.is_active = TRUE;          -- Fetch only active deals, or remove d.is_active for all
+        `;
+        const result = await db.query(query, [dealId]);
+
+        if (result.rows.length > 0) {
+            res.json(result.rows[0]);
+        } else {
+            res.status(404).json({ error: 'Deal not found or not active' });
+        }
+    } catch (err) {
+        console.error(`Error fetching deal with ID ${dealId}:`, err);
+        res.status(500).json({ error: 'Failed to fetch deal details' });
+    }
+});
+
+// ... (other routes, app.listen) ...ß
 // ... (rest of server.js) ...
 // GET all products (NOW WITH PAGINATION)
 app.get('/api/products', async (req, res) => { // Route handler starts
