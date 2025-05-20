@@ -292,7 +292,84 @@ app.get('/api/deals/:dealId', async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch deal details' });
     }
 });
+// server.js
+// ... (other require statements, middleware, existing /api/suppliers route) ...
 
+// --- NEW: GET a single supplier by ID, including some of their products ---
+// e.g., /api/suppliers/1
+app.get('/api/suppliers/:supplierId', async (req, res) => {
+    const { supplierId } = req.params;
+    const PRODUCTS_LIMIT_IN_DETAIL = 6; // How many products to show in the supplier detail view
+
+    if (isNaN(parseInt(supplierId, 10))) {
+        return res.status(400).json({ error: 'Invalid Supplier ID format.' });
+    }
+
+    const client = await db.pool.connect(); // Use a client for multiple queries
+
+    try {
+        // --- Query 1: Get supplier details ---
+        const supplierQuery = `
+            SELECT 
+                id, 
+                name, 
+                category, 
+                location, 
+                rating, 
+                image_url, 
+                description, -- Assuming you add a description column to suppliers table
+                created_at
+                -- Add phone, email, website if you add them to the suppliers table
+            FROM suppliers 
+            WHERE id = $1;
+        `;
+        const supplierResult = await client.query(supplierQuery, [supplierId]);
+
+        if (supplierResult.rows.length === 0) {
+            client.release();
+            return res.status(404).json({ error: 'Supplier not found' });
+        }
+        const supplierDetails = supplierResult.rows[0];
+
+        // --- Query 2: Get some products for this supplier ---
+        const productsQuery = `
+            SELECT 
+                id, 
+                name, 
+                price, 
+                discount_price, 
+                image_url, 
+                is_on_sale,
+                category AS product_category -- Alias to avoid conflict if supplier also has 'category'
+            FROM products 
+            WHERE supplier_id = $1
+            ORDER BY created_at DESC -- Or by popularity, etc.
+            LIMIT $2;
+        `;
+        const productsResult = await client.query(productsQuery, [supplierId, PRODUCTS_LIMIT_IN_DETAIL]);
+        supplierDetails.products = productsResult.rows; // Add products array to supplierDetails
+
+        // --- Query 3 (Optional): Get total count of products for this supplier to indicate if there are more ---
+        const totalProductsCountQuery = 'SELECT COUNT(*) AS total_supplier_products FROM products WHERE supplier_id = $1;';
+        const totalProductsCountResult = await client.query(totalProductsCountQuery, [supplierId]);
+        const totalSupplierProducts = parseInt(totalProductsCountResult.rows[0].total_supplier_products, 10);
+        
+        supplierDetails.hasMoreProducts = totalSupplierProducts > PRODUCTS_LIMIT_IN_DETAIL;
+        supplierDetails.totalProductsCount = totalSupplierProducts; // Also send total count
+
+        res.json(supplierDetails);
+
+    } catch (err) {
+        console.error(`Error fetching supplier with ID ${supplierId}:`, err);
+        res.status(500).json({ error: 'Failed to fetch supplier details' });
+    } finally {
+        if (client) {
+            client.release(); // Release the client back to the pool
+        }
+    }
+});
+
+// ... (other routes, app.listen) ...
 // ... (other routes, app.listen) ...ß
 // ... (rest of server.js) ...
 // GET all products (NOW WITH PAGINATION)
