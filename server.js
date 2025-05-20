@@ -267,6 +267,9 @@ app.get('/api/deals/:dealId', async (req, res) => {
                 d.product_id, 
                 p.name AS product_name, -- Name of the linked product
                 p.image_url AS product_image_url, -- Image of the linked product
+                p.price AS product_price,             -- <<< ADD THIS
+    p.discount_price AS product_discount_price, -- <<< ADD THIS
+    p.is_on_sale AS product_is_on_sale, -- <<< ADD THIS (or infer from deal)
                 d.supplier_id,
                 s.name AS supplier_name, -- Name of the linked supplier
                 d.image_url, 
