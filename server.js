@@ -1048,7 +1048,106 @@ app.delete('/api/favorites/:productId', async (req, res) => {
         res.status(500).json({ error: 'Failed to remove favorite' });
     }
 });
+// server.js
+// ... (other routes) ...
 
+// --- NEW: GET Featured Items (from dedicated featured_items table) ---
+app.get('/api/featured-items', async (req, res) => {
+    const SLIDER_ITEM_LIMIT = 5; // Max items for the slider
+
+    try {
+        // Step 1: Get active featured item definitions
+        const featuredDefinitionsQuery = `
+            SELECT 
+                id, item_type, item_id, display_order,
+                custom_title, custom_description, custom_image_url
+                -- Add call_to_action_text, link_override if you add them to the table
+            FROM featured_items
+            WHERE is_active = TRUE
+              AND (active_from IS NULL OR active_from <= NOW())
+              AND (active_until IS NULL OR active_until >= NOW())
+            ORDER BY display_order ASC, created_at DESC
+            LIMIT $1;
+        `;
+        const featuredDefsResult = await db.query(featuredDefinitionsQuery, [SLIDER_ITEM_LIMIT]);
+        const featuredDefinitions = featuredDefsResult.rows;
+
+        if (featuredDefinitions.length === 0) {
+            return res.json([]); // No active featured items
+        }
+
+        // Step 2: Hydrate items with actual data if custom fields are null
+        const hydratedItems = await Promise.all(featuredDefinitions.map(async (feature) => {
+            let itemData = {};
+            let originalItem = null;
+
+            // Common properties from featured_items table
+            const baseFeature = {
+                featureId: feature.id, // ID from featured_items table
+                type: feature.item_type,
+                id: feature.item_id, // Original item's ID
+                title: feature.custom_title,
+                description: feature.custom_description,
+                imageUrl: feature.custom_image_url,
+                // link: `/somepath/${feature.item_type}/${feature.item_id}` // Construct a link
+            };
+
+            if (feature.item_type === 'product') {
+                if (!baseFeature.title || !baseFeature.description || !baseFeature.imageUrl) {
+                    const productResult = await db.query('SELECT name, description, image_url, price, discount_price, is_on_sale FROM products WHERE id = $1', [feature.item_id]);
+                    if (productResult.rows.length > 0) originalItem = productResult.rows[0];
+                }
+                itemData = {
+                    ...baseFeature,
+                    title: baseFeature.title || originalItem?.name,
+                    description: baseFeature.description || originalItem?.description,
+                    imageUrl: baseFeature.imageUrl || originalItem?.image_url,
+                    // Product specific data for the card if needed by frontend
+                    price: originalItem?.price,
+                    discount_price: originalItem?.discount_price,
+                    is_on_sale: originalItem?.is_on_sale,
+                };
+            } else if (feature.item_type === 'deal') {
+                if (!baseFeature.title || !baseFeature.description || !baseFeature.imageUrl) {
+                    const dealResult = await db.query('SELECT title, description, image_url, discount_percentage, end_date FROM deals WHERE id = $1', [feature.item_id]);
+                    if (dealResult.rows.length > 0) originalItem = dealResult.rows[0];
+                }
+                itemData = {
+                    ...baseFeature,
+                    title: baseFeature.title || originalItem?.title,
+                    description: baseFeature.description || originalItem?.description,
+                    imageUrl: baseFeature.imageUrl || originalItem?.image_url,
+                    // Deal specific data
+                    discount_percentage: originalItem?.discount_percentage,
+                    end_date: originalItem?.end_date,
+                };
+            } else if (feature.item_type === 'supplier') {
+                if (!baseFeature.title || !baseFeature.description || !baseFeature.imageUrl) {
+                    const supplierResult = await db.query('SELECT name, category, image_url, rating, location FROM suppliers WHERE id = $1', [feature.item_id]);
+                    if (supplierResult.rows.length > 0) originalItem = supplierResult.rows[0];
+                }
+                itemData = {
+                    ...baseFeature,
+                    title: baseFeature.title || originalItem?.name,
+                    description: baseFeature.description || originalItem?.category, // Using category as desc for supplier feature
+                    imageUrl: baseFeature.imageUrl || originalItem?.image_url,
+                    // Supplier specific data
+                    rating: originalItem?.rating,
+                    location: originalItem?.location,
+                };
+            }
+            return itemData;
+        }));
+
+        res.json(hydratedItems.filter(item => item.title)); // Filter out items that couldn't be fully hydrated (e.g., original deleted)
+
+    } catch (err) {
+        console.error("Error fetching featured items:", err);
+        res.status(500).json({ error: 'Failed to fetch featured items' });
+    }
+});
+
+// ... (app.listen) ...
 // ... (rest of server.js, app.listen)
 
 // --- Start the Server ---
