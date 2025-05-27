@@ -3,7 +3,7 @@ require('dotenv').config(); // Load environment variables from .env file
 const db = require('./config/db'); // Import the db config
 const express = require('express');
 const cors = require('cors');
-
+const authSupplier = require('./middleware/authSupplier'); // <<< IMPORT
 const app = express();
 const PORT = process.env.PORT || 3001; // Use port from .env or default to 3001
 const bcrypt = require('bcrypt');
@@ -861,6 +861,19 @@ app.get('/api/cart', async (req, res) => {
       console.error(`Error fetching cart for user ${userId}:`, err);
       res.status(500).json({ error: 'Failed to fetch cart items' });
   }
+});
+app.get('/api/supplier/products', authSupplier, async (req, res) => { // <<< Use middleware
+    const supplierId = req.supplier.supplierId; // Get supplierId from decoded JWT
+
+    try {
+        // TODO: Add pagination later if needed
+        const query = 'SELECT * FROM products WHERE supplier_id = $1 ORDER BY created_at DESC';
+        const result = await db.query(query, [supplierId]);
+        res.json(result.rows);
+    } catch (err) {
+        console.error(`Error fetching products for supplier ${supplierId}:`, err);
+        res.status(500).json({ error: 'Failed to fetch supplier products' });
+    }
 });
 
 // POST - Add or update item in cart
