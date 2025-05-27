@@ -6,7 +6,8 @@ const cors = require('cors');
 
 const app = express();
 const PORT = process.env.PORT || 3001; // Use port from .env or default to 3001
-
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 // --- Middleware ---
 // Enable CORS for all routes and origins (adjust for production later)
 app.use(cors());
@@ -919,7 +920,52 @@ app.delete('/api/cart/item/:productId', async (req, res) => {
   }
 });
 
+// --- SUPPLIER AUTHENTICATION ---
+app.post('/api/auth/supplier/login', async (req, res) => {
+    const { email, password } = req.body;
 
+    if (!email || !password) {
+        return res.status(400).json({ error: 'Email and password are required.' });
+    }
+
+    try {
+        const supplierResult = await db.query('SELECT id, name, email, password_hash FROM suppliers WHERE email = $1', [email.toLowerCase()]);
+
+        if (supplierResult.rows.length === 0) {
+            return res.status(401).json({ error: 'Invalid credentials.' }); // User not found
+        }
+
+        const supplier = supplierResult.rows[0];
+
+        const match = await bcrypt.compare(password, supplier.password_hash);
+        if (!match) {
+            return res.status(401).json({ error: 'Invalid credentials.' }); // Password doesn't match
+        }
+
+        // Generate JWT
+        const tokenPayload = {
+            supplierId: supplier.id,
+            name: supplier.name,
+            email: supplier.email,
+            // Add other roles/permissions if needed later
+        };
+        const token = jwt.sign(tokenPayload, process.env.JWT_SECRET, { expiresIn: '1d' }); // Token expires in 1 day
+
+        res.json({ 
+            message: 'Login successful', 
+            token,
+            supplier: { // Send back some supplier info for the frontend
+                id: supplier.id,
+                name: supplier.name,
+                email: supplier.email
+            }
+        });
+
+    } catch (err) {
+        console.error('Supplier login error:', err);
+        res.status(500).json({ error: 'Internal server error during login.' });
+    }
+});
 
 // TODO LATER: Add PUT endpoint to specifically SET quantity (useful for +/- buttons)
 // PUT /api/cart/item/{productId} { userId, newQuantity } -> UPDATE cart_items SET quantity = newQuantity ...
