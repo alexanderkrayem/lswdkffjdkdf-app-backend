@@ -984,7 +984,69 @@ app.post('/api/auth/supplier/login', async (req, res) => {
 // PUT /api/cart/item/{productId} { userId, newQuantity } -> UPDATE cart_items SET quantity = newQuantity ...
 // server.js
 // ... (other require statements, middleware, existing cart routes GET, POST, DELETE) ...
+// server.js
+// ... (authSupplier middleware, GET /api/supplier/products route) ...
 
+// POST - Create a new product for the authenticated supplier
+app.post('/api/supplier/products', authSupplier, async (req, res) => {
+    const supplierId = req.supplier.supplierId; // From authenticated JWT
+    const { 
+        name, 
+        description, 
+        price, 
+        discount_price, // Optional
+        category, 
+        image_url,      // Optional
+        is_on_sale,     // Optional, boolean
+        stock_level     // Optional, integer
+    } = req.body;
+
+    // Basic Validation
+    if (!name || !price || !category) { // Add more required fields as necessary
+        return res.status(400).json({ error: 'Name, price, and category are required.' });
+    }
+    if (isNaN(parseFloat(price)) || parseFloat(price) < 0) {
+         return res.status(400).json({ error: 'Invalid price format.' });
+    }
+    if (discount_price && (isNaN(parseFloat(discount_price)) || parseFloat(discount_price) < 0)) {
+        return res.status(400).json({ error: 'Invalid discount price format.' });
+    }
+    if (stock_level && (isNaN(parseInt(stock_level)) || parseInt(stock_level) < 0)) {
+        return res.status(400).json({ error: 'Invalid stock level format.' });
+    }
+
+
+    try {
+        const query = `
+            INSERT INTO products 
+                (supplier_id, name, description, price, discount_price, category, image_url, is_on_sale, stock_level, created_at)
+            VALUES 
+                ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+            RETURNING *; -- Return the newly created product
+        `;
+        const values = [
+            supplierId,
+            name,
+            description || null, // Default to null if not provided
+            parseFloat(price),
+            discount_price ? parseFloat(discount_price) : null,
+            category,
+            image_url || null,
+            is_on_sale || false, // Default to false
+            stock_level ? parseInt(stock_level) : 0 // Default to 0
+        ];
+
+        const result = await db.query(query, values);
+        res.status(201).json(result.rows[0]); // Send back the created product
+    } catch (err) {
+        console.error(`Error creating product for supplier ${supplierId}:`, err);
+        // Check for specific DB errors if needed (e.g., foreign key violation if category was a FK)
+        res.status(500).json({ error: 'Failed to create product.' });
+    }
+});
+
+// ... (PUT and DELETE for products will go here later) ...
+// ... (app.listen) ...
 // --- NEW: PUT - Update quantity of a specific item in cart ---
 // Expects userId in query, productId in URL path, { newQuantity } in request body
 // e.g., PUT /api/cart/item/101?userId=12345  Body: { "newQuantity": 3 }
