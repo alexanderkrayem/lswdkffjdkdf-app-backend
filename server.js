@@ -1044,7 +1044,126 @@ app.post('/api/supplier/products', authSupplier, async (req, res) => {
         res.status(500).json({ error: 'Failed to create product.' });
     }
 });
+// server.js
+// ... (authSupplier middleware, GET and POST /api/supplier/products routes) ...
 
+// PUT - Update an existing product for the authenticated supplier
+// server.js
+// Ensure authSupplier middleware is imported: const authSupplier = require('./middleware/authSupplier');
+// Ensure db object is available: const db = require('./config/db');
+
+// PUT - Update an existing product for the authenticated supplier
+app.put('/api/supplier/products/:productId', authSupplier, async (req, res) => {
+    const supplierId = req.supplier.supplierId; // From JWT middleware
+    const { productId } = req.params;
+    const {
+        name,
+        description,
+        price,
+        discount_price, // Can be null or a value
+        category,
+        image_url,      // Can be null or a value
+        is_on_sale,     // Should be boolean
+        stock_level     // Should be integer
+    } = req.body;
+
+    // --- Input Validation ---
+    const parsedProductId = parseInt(productId, 10);
+    if (isNaN(parsedProductId)) {
+        return res.status(400).json({ error: 'Invalid Product ID format.' });
+    }
+
+    if (!name || typeof name !== 'string' || name.trim() === '') {
+        return res.status(400).json({ error: 'Product name is required and cannot be empty.' });
+    }
+    if (price === undefined || isNaN(parseFloat(price)) || parseFloat(price) < 0) {
+        return res.status(400).json({ error: 'Valid product price is required.' });
+    }
+    if (!category || typeof category !== 'string' || category.trim() === '') {
+        return res.status(400).json({ error: 'Product category is required.' });
+    }
+    if (discount_price !== undefined && discount_price !== null && (isNaN(parseFloat(discount_price)) || parseFloat(discount_price) < 0)) {
+        return res.status(400).json({ error: 'Discount price must be a valid number if provided.' });
+    }
+    if (stock_level !== undefined && stock_level !== null && (isNaN(parseInt(stock_level, 10)) || parseInt(stock_level, 10) < 0)) {
+        return res.status(400).json({ error: 'Stock level must be a valid non-negative integer if provided.' });
+    }
+    // is_on_sale will be coerced to boolean later
+
+    try {
+        // 1. Verify the product exists and belongs to the authenticated supplier
+        const checkOwnerQuery = 'SELECT supplier_id FROM products WHERE id = $1';
+        const ownerResult = await db.query(checkOwnerQuery, [parsedProductId]);
+
+        if (ownerResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Product not found.' });
+        }
+        // Ensure supplierId from token (number) matches supplier_id from DB (likely number)
+        if (ownerResult.rows[0].supplier_id !== supplierId) { 
+            return res.status(403).json({ error: 'Forbidden: You do not own this product.' });
+        }
+
+        // 2. If ownership is confirmed, proceed with update
+        // The database trigger will handle 'updated_at = NOW()' automatically.
+        const updateQuery = `
+            UPDATE products 
+            SET 
+                name = $1, 
+                description = $2, 
+                price = $3, 
+                discount_price = $4, 
+                category = $5, 
+                image_url = $6, 
+                is_on_sale = $7, 
+                stock_level = $8
+            WHERE id = $9 AND supplier_id = $10 -- Double check supplier_id for extra safety
+            RETURNING *; 
+        `;
+
+        const finalPrice = parseFloat(price);
+        const finalDiscountPrice = (discount_price !== undefined && discount_price !== null && !isNaN(parseFloat(discount_price))) ? parseFloat(discount_price) : null;
+        const finalIsOnSale = (is_on_sale === true || is_on_sale === 'true'); // Coerce to boolean
+        const finalStockLevel = (stock_level !== undefined && stock_level !== null && !isNaN(parseInt(stock_level,10))) ? parseInt(stock_level, 10) : 0;
+
+
+        const values = [
+            name.trim(),
+            description || null, // Use null if description is empty or not provided
+            finalPrice,
+            finalDiscountPrice,
+            category.trim(),
+            image_url || null,   // Use null if image_url is empty or not provided
+            finalIsOnSale,
+            finalStockLevel,
+            parsedProductId,    // for WHERE id = $9
+            supplierId          // for WHERE supplier_id = $10
+        ];
+
+        console.log(`[SUPPLIER_PRODUCT_UPDATE] Updating product ID ${parsedProductId} for supplier ID ${supplierId} with values:`, {
+            name: values[0], category: values[4], price: values[2], stock: values[7] // Log some key values
+        });
+
+        const result = await db.query(updateQuery, values);
+
+        if (result.rows.length === 0) {
+            // This case should ideally not be reached if the owner check passed and ID is correct,
+            // but it's a safeguard.
+            console.error(`[SUPPLIER_PRODUCT_UPDATE] Update failed for product ID ${parsedProductId} despite ownership check.`);
+            return res.status(404).json({ error: 'Product not found during update or update failed unexpectedly.' });
+        }
+
+        console.log(`[SUPPLIER_PRODUCT_UPDATE] Product ID ${parsedProductId} updated successfully.`);
+        res.status(200).json(result.rows[0]); // Send back the updated product
+
+    } catch (err) {
+        console.error(`[SUPPLIER_PRODUCT_UPDATE] Error updating product ${parsedProductId} for supplier ${supplierId}:`, err);
+        // Check for specific database errors if needed, e.g., constraint violations
+        res.status(500).json({ error: 'Failed to update product due to a server error.' });
+    }
+});
+
+// ... (DELETE for products will go here later) ...
+// ... (app.listen) ...
 // ... (PUT and DELETE for products will go here later) ...
 // ... (app.listen) ...
 // --- NEW: PUT - Update quantity of a specific item in cart ---
