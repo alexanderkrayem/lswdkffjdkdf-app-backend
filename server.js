@@ -1163,6 +1163,51 @@ app.put('/api/supplier/products/:productId', authSupplier, async (req, res) => {
 });
 
 // ... (DELETE for products will go here later) ...
+app.delete('/api/supplier/products/:productId', authSupplier, async (req, res) => {
+    const supplierId = req.supplier.supplierId; // From JWT
+    const { productId } = req.params;
+
+    const parsedProductId = parseInt(productId, 10);
+    if (isNaN(parsedProductId)) {
+        return res.status(400).json({ error: 'Invalid Product ID format.' });
+    }
+
+    try {
+        // 1. Verify the product exists and belongs to the supplier before deleting
+        const checkOwnerQuery = 'SELECT supplier_id FROM products WHERE id = $1';
+        const ownerResult = await db.query(checkOwnerQuery, [parsedProductId]);
+
+        if (ownerResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Product not found.' });
+        }
+        if (ownerResult.rows[0].supplier_id !== supplierId) {
+            return res.status(403).json({ error: 'Forbidden: You do not own this product to delete it.' });
+        }
+
+        // 2. If ownership confirmed, delete the product
+        const deleteQuery = 'DELETE FROM products WHERE id = $1 AND supplier_id = $2 RETURNING id;'; // RETURNING id to confirm deletion
+        const result = await db.query(deleteQuery, [parsedProductId, supplierId]);
+
+        if (result.rowCount === 0) {
+            // Should not happen if previous checks passed, but good for robustness
+            console.error(`[SUPPLIER_PRODUCT_DELETE] Failed to delete product ${parsedProductId} even after ownership check.`);
+            return res.status(404).json({ error: 'Product not found or delete failed unexpectedly.' });
+        }
+
+        console.log(`[SUPPLIER_PRODUCT_DELETE] Product ID ${parsedProductId} deleted successfully by supplier ID ${supplierId}.`);
+        res.status(200).json({ message: 'Product deleted successfully.', deletedProductId: parsedProductId });
+        // Alternatively, res.sendStatus(204) for No Content on successful delete.
+
+    } catch (err) {
+        console.error(`[SUPPLIER_PRODUCT_DELETE] Error deleting product ${parsedProductId} for supplier ${supplierId}:`, err);
+        // Check for foreign key constraint errors if products are linked elsewhere (e.g., order_items)
+        // and ON DELETE behavior isn't SET NULL or CASCADE
+        if (err.code === '23503') { // Foreign key violation
+            return res.status(409).json({ error: 'Cannot delete product. It is referenced in existing orders or other records. Please resolve dependencies first.' });
+        }
+        res.status(500).json({ error: 'Failed to delete product due to a server error.' });
+    }
+}); 
 // ... (app.listen) ...
 // ... (PUT and DELETE for products will go here later) ...
 // ... (app.listen) ...
