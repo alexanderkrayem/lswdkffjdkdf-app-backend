@@ -1584,7 +1584,60 @@ app.get('/api/supplier/orders', authSupplier, async (req, res) => {
         }
     }
 });
+// server.js
+// ... (bcrypt, jwt imports are already there) ...
 
+// --- ADMIN AUTHENTICATION ---
+app.post('/api/auth/admin/login', async (req, res) => {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+        return res.status(400).json({ error: 'Email and password are required.' });
+    }
+
+    try {
+        const adminResult = await db.query('SELECT id, email, password_hash, full_name, role FROM admins WHERE email = $1', [email.toLowerCase()]);
+
+        if (adminResult.rows.length === 0) {
+            return res.status(401).json({ error: 'Invalid credentials or not an admin.' });
+        }
+
+        const adminUser = adminResult.rows[0];
+
+        if (adminUser.role !== 'admin') { // Extra check
+            return res.status(403).json({ error: 'Access denied. Not an admin user.' });
+        }
+
+        const match = await bcrypt.compare(password, adminUser.password_hash);
+        if (!match) {
+            return res.status(401).json({ error: 'Invalid credentials.' });
+        }
+
+        // Generate JWT for Admin
+        const tokenPayload = {
+            adminId: adminUser.id, // Use adminId or userId
+            email: adminUser.email,
+            role: adminUser.role,
+            name: adminUser.full_name
+        };
+        const token = jwt.sign(tokenPayload, process.env.JWT_ADMIN_SECRET, { expiresIn: '8h' }); // Admin token might have different expiry
+
+        res.json({ 
+            message: 'Admin login successful', 
+            token,
+            admin: {
+                id: adminUser.id,
+                email: adminUser.email,
+                name: adminUser.full_name,
+                role: adminUser.role
+            }
+        });
+
+    } catch (err) {
+        console.error('Admin login error:', err);
+        res.status(500).json({ error: 'Internal server error during admin login.' });
+    }
+});
 // ... (app.listen) ...
 // ... (app.listen) ...
 

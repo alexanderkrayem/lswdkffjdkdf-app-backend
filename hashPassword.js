@@ -1,7 +1,7 @@
 // hashPassword.js
 const bcrypt = require('bcrypt');
 const saltRounds = 10;
-const plainPassword = 'supplierPassword123'; // Choose a password
+const plainPassword = ''; // Choose a password
 
 bcrypt.hash(plainPassword, saltRounds, function(err, hash) {
     if (err) {
