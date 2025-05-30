@@ -1468,7 +1468,124 @@ app.get('/api/featured-items', async (req, res) => {
 });
 
 // ... (app.listen) ...
+// server.js
+// ... (authSupplier middleware is imported) ...
 
+// GET orders relevant to the authenticated supplier
+app.get('/api/supplier/orders', authSupplier, async (req, res) => {
+    const supplierId = req.supplier.supplierId;
+
+    // Pagination parameters (optional, but good for many orders)
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 10; // Default 10 orders per page
+    const offset = (page - 1) * limit;
+
+    const client = await db.pool.connect(); // Use a client for multiple operations
+
+    try {
+        // Step 1: Find distinct order IDs that contain products from this supplier
+        // Also get overall order details and customer info
+        const distinctOrdersQuery = `
+            SELECT DISTINCT
+                o.id AS order_id,
+                o.order_date,
+                o.status AS order_status,
+                o.total_amount AS order_total_amount, -- Total for the entire customer order
+                up.full_name AS customer_name,
+                up.phone_number AS customer_phone,
+                up.address_line1 AS customer_address1,
+                up.address_line2 AS customer_address2,
+                up.city AS customer_city
+            FROM orders o
+            JOIN order_items oi ON o.id = oi.order_id
+            JOIN products p ON oi.product_id = p.id
+            LEFT JOIN user_profiles up ON o.user_id = up.user_id
+            WHERE p.supplier_id = $1
+            ORDER BY o.order_date DESC
+            LIMIT $2 OFFSET $3;
+        `;
+        const distinctOrdersResult = await client.query(distinctOrdersQuery, [supplierId, limit, offset]);
+        const orders = distinctOrdersResult.rows;
+
+        if (orders.length === 0) {
+            client.release();
+            return res.json({
+                items: [],
+                currentPage: page,
+                totalPages: 0,
+                totalItems: 0
+            });
+        }
+
+        // Step 2: For each order, fetch the specific items that belong to this supplier
+        const orderIds = orders.map(o => o.order_id);
+        const orderItemsQuery = `
+            SELECT 
+                oi.order_id,
+                oi.id AS order_item_id,
+                oi.product_id,
+                p.name AS product_name,
+                p.image_url AS product_image_url,
+                oi.quantity,
+                oi.price_at_time_of_order,
+                oi.supplier_item_status -- Assuming you added this column
+            FROM order_items oi
+            JOIN products p ON oi.product_id = p.id
+            WHERE oi.order_id = ANY($1::int[]) AND p.supplier_id = $2;
+        `;
+        const orderItemsResult = await client.query(orderItemsQuery, [orderIds, supplierId]);
+        const itemsByOrderId = {};
+        orderItemsResult.rows.forEach(item => {
+            if (!itemsByOrderId[item.order_id]) {
+                itemsByOrderId[item.order_id] = [];
+            }
+            itemsByOrderId[item.order_id].push(item);
+        });
+
+        // Step 3: Combine order details with their respective items and calculate supplier's portion value
+        const responseOrders = orders.map(order => {
+            const itemsForThisSupplier = itemsByOrderId[order.order_id] || [];
+            const supplierOrderValue = itemsForThisSupplier.reduce((sum, item) => {
+                return sum + (parseFloat(item.price_at_time_of_order) * item.quantity);
+            }, 0);
+
+            return {
+                ...order,
+                items_for_this_supplier: itemsForThisSupplier,
+                supplier_order_value: supplierOrderValue.toFixed(2)
+            };
+        });
+
+        // Step 4: Get total count of relevant orders for pagination metadata
+        const totalRelevantOrdersCountQuery = `
+            SELECT COUNT(DISTINCT o.id) AS total_items
+            FROM orders o
+            JOIN order_items oi ON o.id = oi.order_id
+            JOIN products p ON oi.product_id = p.id
+            WHERE p.supplier_id = $1;
+        `;
+        const totalCountResult = await client.query(totalRelevantOrdersCountQuery, [supplierId]);
+        const totalItems = parseInt(totalCountResult.rows[0].total_items, 10);
+        const totalPages = Math.ceil(totalItems / limit);
+
+        res.json({
+            items: responseOrders,
+            currentPage: page,
+            totalPages: totalPages,
+            totalItems: totalItems
+        });
+
+    } catch (err) {
+        console.error(`Error fetching orders for supplier ${supplierId}:`, err);
+        res.status(500).json({ error: 'Failed to fetch supplier orders' });
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
+});
+
+// ... (app.listen) ...
 // ... (app.listen) ...
 
 // ... (app.listen) ...
