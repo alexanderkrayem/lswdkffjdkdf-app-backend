@@ -1664,6 +1664,88 @@ app.get('/api/admin/suppliers', authAdmin, async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch suppliers.' });
     }
 });
+
+// server.js
+// ... (bcrypt is already imported)
+// ... (authAdmin middleware is imported) ...
+
+// --- ADMIN ROUTES (Continued) ---
+
+// ... (GET /api/admin/suppliers) ...
+
+// POST - Admin creates a new supplier
+app.post('/api/admin/suppliers', authAdmin, async (req, res) => {
+    const {
+        name,
+        email,
+        password, // Admin will set an initial password
+        category,
+        location,
+        rating, // Optional
+        description, // Optional
+        image_url, // Optional
+        is_active = true // Default to active, admin can change later
+    } = req.body;
+
+    // --- Input Validation ---
+    if (!name || !email || !password || !category) {
+        return res.status(400).json({ error: 'Name, email, password, and category are required for new supplier.' });
+    }
+    // Add more specific validations (email format, password strength etc.)
+    if (password.length < 6) { // Example password policy
+         return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
+    }
+    // Validate email format (basic regex example)
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email.toLowerCase())) {
+        return res.status(400).json({ error: 'Invalid email format.' });
+    }
+
+
+    try {
+        // Check if email already exists
+        const existingSupplier = await db.query('SELECT id FROM suppliers WHERE email = $1', [email.toLowerCase()]);
+        if (existingSupplier.rows.length > 0) {
+            return res.status(409).json({ error: 'Email already registered for another supplier.' }); // 409 Conflict
+        }
+
+        // Hash the password
+        const saltRounds = 10;
+        const password_hash = await bcrypt.hash(password, saltRounds);
+
+        const insertQuery = `
+            INSERT INTO suppliers 
+            (name, email, password_hash, category, location, rating, description, image_url, is_active, created_at, updated_at) 
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+            RETURNING id, name, email, category, location, rating, is_active, created_at; 
+            -- Return a subset of fields, not the hash
+        `;
+        const values = [
+            name.trim(),
+            email.toLowerCase().trim(),
+            password_hash,
+            category.trim(),
+            location || null,
+            rating ? parseFloat(rating) : null,
+            description || null,
+            image_url || null,
+            is_active === undefined ? true : Boolean(is_active) // Default to true
+        ];
+
+        const result = await db.query(insertQuery, values);
+        const newSupplier = result.rows[0];
+
+        console.log(`[ADMIN] New supplier created by admin ${req.admin.adminId}: ID ${newSupplier.id}, Email: ${newSupplier.email}`);
+        res.status(201).json(newSupplier);
+
+    } catch (err) {
+        console.error("[ADMIN] Error creating supplier:", err);
+        if (err.code === '23505' && err.constraint === 'suppliers_email_key') { // Check for unique constraint on email
+             return res.status(409).json({ error: 'This email is already in use by another supplier.' });
+        }
+        res.status(500).json({ error: 'Failed to create supplier due to a server error.' });
+    }
+});
 // ... (app.listen) ...
 // ... (rest of server.js, app.listen)
 
