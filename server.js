@@ -8,6 +8,8 @@ const app = express();
 const PORT = process.env.PORT || 3001; // Use port from .env or default to 3001
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const authAdmin = require('./middleware/authAdmin'); // IMPORT THIS
+
 // --- Middleware ---
 // Enable CORS for all routes and origins (adjust for production later)
 app.use(cors());
@@ -1640,7 +1642,28 @@ app.post('/api/auth/admin/login', async (req, res) => {
 });
 // ... (app.listen) ...
 // ... (app.listen) ...
-
+// --- ADMIN ROUTES ---
+app.get('/api/admin/suppliers', authAdmin, async (req, res) => {
+    console.log('[ADMIN] Authenticated admin:', req.admin); // Log to see if middleware works
+    try {
+        // For now, select core fields. Add 'is_active' if you create that column.
+        const query = 'SELECT id, name, email, category, location, rating, created_at FROM suppliers ORDER BY created_at DESC';
+        const result = await db.query(query);
+        
+        // For pagination (implement fully later if needed)
+        // const totalItems = result.rows.length; // Simple count for now if no DB count
+        
+        res.json({
+            items: result.rows,
+            // currentPage: 1, 
+            // totalPages: 1, 
+            // totalItems: totalItems
+        });
+    } catch (err) {
+        console.error("[ADMIN] Error fetching suppliers:", err);
+        res.status(500).json({ error: 'Failed to fetch suppliers.' });
+    }
+});
 // ... (app.listen) ...
 // ... (rest of server.js, app.listen)
 
