@@ -1748,7 +1748,98 @@ app.post('/api/admin/suppliers', authAdmin, async (req, res) => {
 });
 // ... (app.listen) ...
 // ... (rest of server.js, app.listen)
+// server.js
+// ... (authAdmin is imported) ...
 
+// --- ADMIN ROUTES (Continued) ---
+// ... (GET /api/admin/suppliers, POST /api/admin/suppliers) ...
+
+// PUT - Admin updates an existing supplier's details
+app.put('/api/admin/suppliers/:supplierId', authAdmin, async (req, res) => {
+    const { supplierId } = req.params;
+    const parsedSupplierId = parseInt(supplierId, 10);
+
+    if (isNaN(parsedSupplierId)) {
+        return res.status(400).json({ error: 'Invalid Supplier ID format.' });
+    }
+
+    // Fields that an admin can update (password is not updated here)
+    const {
+        name,
+        email, // Admin might need to change email
+        category,
+        location,
+        rating,
+        description,
+        image_url,
+        is_active 
+    } = req.body;
+
+    // Basic Validation
+    if (!name || !email || !category) {
+        return res.status(400).json({ error: 'Name, email, and category are required.' });
+    }
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email.toLowerCase())) {
+        return res.status(400).json({ error: 'Invalid email format.' });
+    }
+    // Add other specific validations as needed...
+
+    try {
+        // Check if the new email (if changed) is already taken by ANOTHER supplier
+        const existingSupplierByEmail = await db.query(
+            'SELECT id FROM suppliers WHERE email = $1 AND id != $2',
+            [email.toLowerCase(), parsedSupplierId]
+        );
+        if (existingSupplierByEmail.rows.length > 0) {
+            return res.status(409).json({ error: 'This email is already in use by another supplier.' });
+        }
+
+        // The database trigger will handle 'updated_at = NOW()' automatically.
+        const updateQuery = `
+            UPDATE suppliers 
+            SET 
+                name = $1, 
+                email = $2,
+                category = $3, 
+                location = $4, 
+                rating = $5, 
+                description = $6, 
+                image_url = $7,
+                is_active = $8 
+                -- No password_hash update here
+            WHERE id = $9
+            RETURNING id, name, email, category, location, rating, is_active, description, image_url, created_at, updated_at;
+        `;
+        const values = [
+            name.trim(),
+            email.toLowerCase().trim(),
+            category.trim(),
+            location || null,
+            rating ? parseFloat(rating) : null,
+            description || null,
+            image_url || null,
+            is_active === undefined ? true : Boolean(is_active), // Default to true if not specified
+            parsedSupplierId
+        ];
+
+        const result = await db.query(updateQuery, values);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Supplier not found or update failed.' });
+        }
+        
+        console.log(`[ADMIN] Supplier ID ${parsedSupplierId} updated by admin ${req.admin.adminId}.`);
+        res.status(200).json(result.rows[0]);
+
+    } catch (err) {
+        console.error(`[ADMIN] Error updating supplier ${parsedSupplierId}:`, err);
+        if (err.code === '23505' && err.constraint === 'suppliers_email_key') { 
+             return res.status(409).json({ error: 'This email is already in use by another supplier.' });
+        }
+        res.status(500).json({ error: 'Failed to update supplier.' });
+    }
+});
 // --- Start the Server ---
 // ... (app.listen code) ...
 
