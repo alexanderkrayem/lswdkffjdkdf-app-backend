@@ -1842,7 +1842,74 @@ app.put('/api/admin/suppliers/:supplierId', authAdmin, async (req, res) => {
 });
 // --- Start the Server ---
 // ... (app.listen code) ...
+// server.js
+// ... (authAdmin middleware is imported) ...
 
+// --- ADMIN ROUTES (Continued) ---
+
+// ... (GET /api/admin/suppliers, POST /api/admin/suppliers, PUT /api/admin/suppliers/:supplierId) ...
+
+// DELETE - Admin deletes a supplier
+app.delete('/api/admin/suppliers/:supplierId', authAdmin, async (req, res) => {
+    const { supplierId } = req.params;
+    const parsedSupplierId = parseInt(supplierId, 10);
+
+    if (isNaN(parsedSupplierId)) {
+        return res.status(400).json({ error: 'Invalid Supplier ID format.' });
+    }
+
+    console.log(`[ADMIN] Attempting to delete supplier ID ${parsedSupplierId} by admin ${req.admin.adminId}.`);
+
+    // Important: Consider what happens to products linked to this supplier.
+    // If products.supplier_id has ON DELETE RESTRICT, this will fail if supplier has products.
+    // If ON DELETE CASCADE, products will also be deleted (DANGEROUS).
+    // If ON DELETE SET NULL, products.supplier_id will become NULL.
+
+    try {
+        // Check if supplier exists before attempting delete (optional, DB will error anyway)
+        const checkQuery = 'SELECT id FROM suppliers WHERE id = $1';
+        const checkResult = await db.query(checkQuery, [parsedSupplierId]);
+
+        if (checkResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Supplier not found.' });
+        }
+
+        // Attempt to delete the supplier
+        const deleteQuery = 'DELETE FROM suppliers WHERE id = $1 RETURNING id, name;'; // RETURNING to confirm
+        const result = await db.query(deleteQuery, [parsedSupplierId]);
+
+        if (result.rowCount === 0) {
+            // This might happen if, for some reason, it existed moments ago but not now,
+            // or if the ID was valid but deletion failed for an unexpected reason not caught by FK.
+            return res.status(404).json({ error: 'Supplier not found or delete operation failed.' });
+        }
+
+        console.log(`[ADMIN] Supplier ID ${result.rows[0].id} (${result.rows[0].name}) deleted successfully by admin ${req.admin.adminId}.`);
+        res.status(200).json({ message: `Supplier "${result.rows[0].name}" deleted successfully.`, deletedSupplierId: result.rows[0].id });
+        // Or res.sendStatus(204) for No Content
+
+    } catch (err) {
+        console.error(`[ADMIN] Error deleting supplier ${parsedSupplierId}:`, err);
+        
+        // Handle foreign key constraint violation (PostgreSQL error code 23503)
+        if (err.code === '23503') { 
+            // You can inspect err.constraint_name if you want to be more specific about which constraint failed
+            let detailMessage = 'This supplier cannot be deleted because they are referenced by other records';
+            if (err.detail && err.detail.includes('products_supplier_id_fkey')) { // Check your actual FK name
+                detailMessage += ' (e.g., existing products are linked to this supplier). Please reassign or delete those products first.';
+            } else if (err.detail && err.detail.includes('deals_supplier_id_fkey')) {
+                detailMessage += ' (e.g., existing deals are linked to this supplier). Please reassign or delete those deals first.';
+            }
+            // Add more checks for other potential foreign key constraints if needed
+
+            return res.status(409).json({ error: detailMessage }); // 409 Conflict
+        }
+        
+        res.status(500).json({ error: 'Failed to delete supplier due to a server error.' });
+    }
+});
+
+// ... (app.listen) ...
 // --- Start the Server ---
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
