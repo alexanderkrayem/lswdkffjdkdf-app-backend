@@ -1614,7 +1614,7 @@ app.get('/api/admin/suppliers', authAdmin, async (req, res) => {
     console.log('[ADMIN] Authenticated admin:', req.admin); // Log to see if middleware works
     try {
         // For now, select core fields. Add 'is_active' if you create that column.
-        const query = 'SELECT id, name, email, category, location, rating, created_at FROM suppliers ORDER BY created_at DESC';
+        const query = 'SELECT id, name, email, category, location, rating, created_at, is_active FROM suppliers ORDER BY created_at DESC';
         const result = await db.query(query);
         
         // For pagination (implement fully later if needed)
