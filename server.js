@@ -47,76 +47,57 @@ app.get('/api/categories', async (req, res) => {
 app.get('/api/search', async (req, res) => {
     const searchTerm = req.query.searchTerm || '';
     const MIN_SEARCH_LENGTH = 3;
-    const DEFAULT_RESULTS_LIMIT = 10; // Default limit for deals & suppliers, and products if no pagination params
+    const DEFAULT_RESULTS_LIMIT = 10;
 
-    // Filters primarily for products
     const categoryFilter = req.query.category || '';
-    const supplierIdFilter = parseInt(req.query.supplierId, 10) || null;
-    const minPriceFilter = parseFloat(req.query.minPrice) || null;
-    const maxPriceFilter = parseFloat(req.query.maxPrice) || null;
-    const sortBy = req.query.sortBy || 'relevance'; // Default sort for products
-
-    // Pagination for product results when filters are active or explicitly requested
+    // ... other filters like supplierIdFilter, minPriceFilter, maxPriceFilter, sortBy ...
+    // ... pagination for products: productPage, productLimit, safeProductPage, safeProductLimit, productOffset ...
+    // (Keeping your existing filter and pagination variable declarations)
     const productPage = parseInt(req.query.page, 10) || 1;
     const productLimit = parseInt(req.query.limit, 10) || DEFAULT_RESULTS_LIMIT;
     const safeProductPage = Math.max(1, productPage);
     const safeProductLimit = Math.max(1, productLimit);
     const productOffset = (safeProductPage - 1) * safeProductLimit;
 
-    if (searchTerm.trim().length < MIN_SEARCH_LENGTH && !categoryFilter && !supplierIdFilter && !minPriceFilter && !maxPriceFilter) {
-        return res.json({
-            searchTerm: searchTerm,
-            results: {
-                products: { items: [], currentPage: 1, totalPages: 0, totalItems: 0, limit: safeProductLimit }, // Add pagination structure
-                deals: [],
-                suppliers: []
-            },
-            message: `Search term or filters required. Search term must be at least ${MIN_SEARCH_LENGTH} characters.`
-        });
+
+    if (searchTerm.trim().length < MIN_SEARCH_LENGTH && !categoryFilter /* && other filters are also empty */) {
+        // ... (your existing return for short search term) ...
+        return res.json({ /* ... empty results ... */ });
     }
 
-    const ftsQueryString = `websearch_to_tsquery('pg_catalog.arabic', $1)`; // $1 will be searchTerm
-    const trigramThreshold = 0.1;
+    const ftsQueryString = `websearch_to_tsquery('pg_catalog.arabic', $1)`;
+    const trigramThreshold = 0.1; // Your existing threshold
 
     try {
-        // --- Dynamic Product Search with Filters and Pagination ---
+        // --- Product Search ---
+        // Main change: JOIN suppliers s and add s.is_active = TRUE
         let productsQuery = `
             SELECT
-                p.id, p.name, p.category, p.price, p.discount_price, p.is_on_sale, p.image_url, p.supplier_id, s.name as supplier_name
+                p.id, p.name, p.category, p.price, p.discount_price, p.is_on_sale, p.image_url, p.supplier_id, s_prod.name as supplier_name
                 ${searchTerm.trim() ? `, ts_rank_cd(p.tsv, product_fts_query.query) AS rank` : ''}
             FROM products p
-            LEFT JOIN suppliers s ON p.supplier_id = s.id
+            LEFT JOIN suppliers s_prod ON p.supplier_id = s_prod.id  -- Renamed alias to s_prod to avoid conflict
             ${searchTerm.trim() ? `, LATERAL ${ftsQueryString} AS product_fts_query(query)` : ''}
         `;
-        let productCountQuery = `SELECT COUNT(DISTINCT p.id) AS total_items FROM products p ${searchTerm.trim() ? `, LATERAL ${ftsQueryString} AS product_fts_query(query)` : ''}`;
+        let productCountQuery = `
+            SELECT COUNT(DISTINCT p.id) AS total_items 
+            FROM products p 
+            LEFT JOIN suppliers s_prod ON p.supplier_id = s_prod.id -- Renamed alias
+            ${searchTerm.trim() ? `, LATERAL ${ftsQueryString} AS product_fts_query(query)` : ''}
+        `;
 
-        const productWhereClauses = [];
+        const productWhereClauses = ["s_prod.is_active = TRUE"]; // <<< ADDED: Filter by active supplier for products
         const productQueryParams = [];
         let productParamCount = 0;
 
         if (searchTerm.trim()) {
-            productQueryParams.push(searchTerm.trim()); // For ftsQueryString $1 and similarity $1
+            productQueryParams.push(searchTerm.trim());
             productWhereClauses.push(`(p.tsv @@ product_fts_query.query OR similarity(p.name, $${productParamCount + 1}) > $${productParamCount + 2})`);
-            productQueryParams.push(trigramThreshold); // For similarity $2
-            productParamCount = 2; // We've used $1 and $2 for searchTerm and threshold
+            productQueryParams.push(trigramThreshold);
+            productParamCount = 2;
         }
-
-        if (categoryFilter) {
-            productWhereClauses.push(`p.category ILIKE $${++productParamCount}`);
-            productQueryParams.push(`%${categoryFilter}%`);
-        }
-        if (supplierIdFilter) {
-            productWhereClauses.push(`p.supplier_id = $${++productParamCount}`);
-            productQueryParams.push(supplierIdFilter);
-        }
-        if (minPriceFilter !== null) {
-            productWhereClauses.push(`(CASE WHEN p.is_on_sale AND p.discount_price IS NOT NULL THEN p.discount_price ELSE p.price END) >= $${++productParamCount}`);
-            productQueryParams.push(minPriceFilter);
-        }
-        if (maxPriceFilter !== null) {
-            productWhereClauses.push(`(CASE WHEN p.is_on_sale AND p.discount_price IS NOT NULL THEN p.discount_price ELSE p.price END) <= $${++productParamCount}`);
-            productQueryParams.push(maxPriceFilter);
-        }
+        // ... (your existing code for adding categoryFilter, supplierIdFilter, minPriceFilter, maxPriceFilter to productWhereClauses and productQueryParams) ...
+        // Ensure those filters use p.category, p.supplier_id etc.
 
         if (productWhereClauses.length > 0) {
             const whereString = ' WHERE ' + productWhereClauses.join(' AND ');
@@ -124,38 +105,28 @@ app.get('/api/search', async (req, res) => {
             productCountQuery += whereString;
         }
 
-        // Product Sorting Logic
-        let productOrderBy = '';
-        if (sortBy === 'price_asc') {
-            productOrderBy = ' ORDER BY (CASE WHEN p.is_on_sale AND p.discount_price IS NOT NULL THEN p.discount_price ELSE p.price END) ASC, p.created_at DESC';
-        } else if (sortBy === 'price_desc') {
-            productOrderBy = ' ORDER BY (CASE WHEN p.is_on_sale AND p.discount_price IS NOT NULL THEN p.discount_price ELSE p.price END) DESC, p.created_at DESC';
-        } else if (sortBy === 'newest') {
+        // ... (your existing productOrderBy logic) ...
+        let productOrderBy = ''; // Your existing sorting logic
+        if (searchTerm.trim()) { // Example, adapt your full logic
+            productOrderBy = ` ORDER BY CASE WHEN p.tsv @@ product_fts_query.query THEN 0 ELSE 1 END, ts_rank_cd(p.tsv, product_fts_query.query) DESC, similarity(p.name, $1) DESC, p.created_at DESC`;
+        } else {
             productOrderBy = ' ORDER BY p.created_at DESC';
-        } else { // Default to relevance if searchTerm is present, otherwise newest
-            if (searchTerm.trim()) {
-                productOrderBy = ` ORDER BY CASE WHEN p.tsv @@ product_fts_query.query THEN 0 ELSE 1 END, ts_rank_cd(p.tsv, product_fts_query.query) DESC, similarity(p.name, $1) DESC, p.created_at DESC`;
-            } else {
-                productOrderBy = ' ORDER BY p.created_at DESC';
-            }
         }
         productsQuery += productOrderBy;
 
-        // Add pagination to product query
+
         productsQuery += ` LIMIT $${++productParamCount} OFFSET $${++productParamCount}`;
         productQueryParams.push(safeProductLimit, productOffset);
         
-        // Final parameters for productCountQuery (only filter params)
-        const productCountQueryParams = productQueryParams.slice(0, productQueryParams.length - 2); // Exclude limit & offset
+        const productCountQueryParams = productQueryParams.slice(0, productQueryParams.length - 2);
 
-        console.log("Product Query:", productsQuery, productQueryParams);
-        console.log("Product Count Query:", productCountQuery, productCountQueryParams);
-
+        console.log("Product Query (Search):", productsQuery, productQueryParams);
         const productsResult = await db.query(productsQuery, productQueryParams);
+        console.log("Product Count Query (Search):", productCountQuery, productCountQueryParams);
         const productCountResult = await db.query(productCountQuery, productCountQueryParams);
+        // ... (rest of your product pagination setup) ...
         const totalProductItems = parseInt(productCountResult.rows[0].total_items, 10);
         const totalProductPages = Math.ceil(totalProductItems / safeProductLimit);
-
         const paginatedProducts = {
             items: productsResult.rows,
             currentPage: safeProductPage,
@@ -164,26 +135,35 @@ app.get('/api/search', async (req, res) => {
             limit: safeProductLimit
         };
 
-        // --- Search Deals (keeps its simpler limit, no advanced filters for now) ---
+
+        // --- Deals Search ---
+        // Main change: If deals are linked to suppliers, join and check supplier's is_active status
         let dealsResult = { rows: [] };
-        if (searchTerm.trim()) { // Only search deals if there's a search term
+        if (searchTerm.trim()) {
+            // Assuming d.supplier_id can be NULL for platform deals
             const dealsQuery = `
                 SELECT d.id, d.title, d.description, d.image_url, ts_rank_cd(d.tsv, query) AS rank
-                FROM deals d, ${ftsQueryString} query
-                WHERE d.is_active = TRUE AND (d.tsv @@ query OR similarity(d.title, $1) > $2)
+                FROM deals d
+                LEFT JOIN suppliers s_deal ON d.supplier_id = s_deal.id -- Join to check supplier status
+                , ${ftsQueryString} query
+                WHERE d.is_active = TRUE 
+                  AND (d.supplier_id IS NULL OR s_deal.is_active = TRUE) -- Deal is platform OR its supplier is active
+                  AND (d.tsv @@ query OR similarity(d.title, $1) > $2)
                 ORDER BY CASE WHEN d.tsv @@ query THEN 0 ELSE 1 END, ts_rank_cd(d.tsv, query) DESC, similarity(d.title, $1) DESC, d.created_at DESC
                 LIMIT $3;
             `;
             dealsResult = await db.query(dealsQuery, [searchTerm.trim(), trigramThreshold, DEFAULT_RESULTS_LIMIT]);
         }
 
-        // --- Search Suppliers (keeps its simpler limit, no advanced filters for now) ---
+        // --- Suppliers Search ---
+        // Main change: Add WHERE s.is_active = TRUE
         let suppliersResult = { rows: [] };
-        if (searchTerm.trim()) { // Only search suppliers if there's a search term
+        if (searchTerm.trim()) {
             const suppliersQuery = `
                 SELECT s.id, s.name, s.category, s.location, s.rating, s.image_url, ts_rank_cd(s.tsv, query) AS rank
                 FROM suppliers s, ${ftsQueryString} query
-                WHERE s.tsv @@ query OR similarity(s.name, $1) > $2
+                WHERE s.is_active = TRUE -- <<< ADDED: Filter for active suppliers
+                  AND (s.tsv @@ query OR similarity(s.name, $1) > $2)
                 ORDER BY CASE WHEN s.tsv @@ query THEN 0 ELSE 1 END, ts_rank_cd(s.tsv, query) DESC, similarity(s.name, $1) DESC, s.id
                 LIMIT $3;
             `;
@@ -192,27 +172,17 @@ app.get('/api/search', async (req, res) => {
 
         res.json({
             searchTerm: searchTerm,
-            filters: { // Echo back applied filters
-                category: categoryFilter,
-                supplierId: supplierIdFilter,
-                minPrice: minPriceFilter,
-                maxPrice: maxPriceFilter,
-                sortBy: sortBy,
-                page: safeProductPage,
-                limit: safeProductLimit
-            },
+            // ... (your existing filters echo back) ...
             results: {
-                products: paginatedProducts, // Products now have pagination structure
+                products: paginatedProducts,
                 deals: dealsResult.rows,
                 suppliers: suppliersResult.rows
             }
         });
 
     } catch (err) {
-        console.error(`Error during global search for term "${searchTerm}":`, err);
-        if (err.message.includes("syntax error in tsquery")) {
-             return res.status(400).json({ error: 'Invalid search query format.' });
-        }
+        // ... (your existing error handling) ...
+        console.error(`Error during global search:`, err);
         res.status(500).json({ error: 'Failed to perform search' });
     }
 });
@@ -222,26 +192,28 @@ app.get('/api/search', async (req, res) => {
 // ... (other require statements, middleware, existing routes) ...
 
 // --- NEW: GET all active deals ---
+// telegram-app-backend/server.js
+
 app.get('/api/deals', async (req, res) => {
     try {
-        // Fetch deals, maybe filter by is_active = TRUE and order by end_date or created_at
         const query = `
             SELECT 
-                id, title, description, discount_percentage, 
-                start_date, end_date, product_id, supplier_id, image_url, 
-                is_active, created_at 
-                -- You might want to join with products/suppliers to get their names for display
-                -- For example: p.name as product_name, s.name as supplier_name
-            FROM deals 
-            WHERE is_active = TRUE 
-            -- AND (end_date IS NULL OR end_date >= CURRENT_DATE) -- Optionally filter out expired deals
-            ORDER BY created_at DESC; 
-            -- Or ORDER BY end_date ASC;
+                d.id, d.title, d.description, d.discount_percentage, 
+                d.start_date, d.end_date, d.product_id, d.supplier_id, d.image_url, 
+                d.is_active, d.created_at,
+                s.name AS supplier_name -- Optionally fetch supplier name if needed by frontend list
+            FROM deals d
+            LEFT JOIN suppliers s ON d.supplier_id = s.id -- Join to check supplier status
+            WHERE d.is_active = TRUE 
+              AND (d.end_date IS NULL OR d.end_date >= CURRENT_DATE) -- Filter out expired deals
+              AND (d.supplier_id IS NULL OR s.is_active = TRUE) -- <<< MODIFIED: Deal is platform OR its supplier is active
+            ORDER BY d.created_at DESC; 
         `;
         const result = await db.query(query);
+        console.log(`[DEALS_LIST] Fetched ${result.rows.length} active deals.`);
         res.json(result.rows);
     } catch (err) {
-        console.error("Error fetching deals:", err);
+        console.error("[DEALS_LIST] Error fetching deals:", err);
         res.status(500).json({ error: 'Failed to fetch deals' });
     }
 });
@@ -376,60 +348,68 @@ app.get('/api/suppliers/:supplierId', async (req, res) => {
 // ... (other routes, app.listen) ...ß
 // ... (rest of server.js) ...
 // GET all products (NOW WITH PAGINATION)
-app.get('/api/products', async (req, res) => { // Route handler starts
-
-    // Default values for pagination
+app.get('/api/products', async (req, res) => {
     const page = parseInt(req.query.page, 10) || 1;
     const limit = parseInt(req.query.limit, 10) || 20;
-
-    // Ensure page and limit are positive
     const safePage = Math.max(1, page);
     const safeLimit = Math.max(1, limit);
-
     const offset = (safePage - 1) * safeLimit;
 
-    // TODO LATER: Variables for searchTerm, category, sortBy will be extracted from req.query here
+    // --- LATER: For category filters etc., they would be added to WHERE clauses below ---
+    // const categoryFilter = req.query.category || ''; 
 
-    try { // Single try block for the entire operation
-        // --- Query to get the paginated items ---
-        let itemsQuery = 'SELECT * FROM products'; // Base query
-        const queryParams = []; // Will hold values for $1, $2, etc.
-        let paramCount = 0; // To keep track of parameter numbers $1, $2...
+    try {
+        let itemsQuery = `
+            SELECT p.* 
+            FROM products p
+            JOIN suppliers s ON p.supplier_id = s.id
+        `;
+        const queryParams = [];
+        let paramCount = 0;
+        let whereClauses = ["s.is_active = TRUE"]; // Start with active supplier filter
 
-        // --- LATER: WHERE clauses for search and filters will be built here ---
-        // Example of how a filter might be added:
-        // if (req.query.category) {
-        //     itemsQuery += (paramCount === 0 ? ' WHERE' : ' AND') + ` category = $${++paramCount}`;
-        //     queryParams.push(req.query.category);
+        // --- LATER: Add other filters here if needed ---
+        // if (categoryFilter) {
+        //     whereClauses.push(`p.category ILIKE $${++paramCount}`);
+        //     queryParams.push(`%${categoryFilter}%`);
         // }
+        
+        if (whereClauses.length > 0) {
+            itemsQuery += ' WHERE ' + whereClauses.join(' AND ');
+        }
 
-        itemsQuery += ' ORDER BY created_at DESC'; // Default sort order
+        itemsQuery += ' ORDER BY p.created_at DESC';
         itemsQuery += ` LIMIT $${++paramCount} OFFSET $${++paramCount}`;
         queryParams.push(safeLimit, offset);
 
-        // console.log("Executing itemsQuery:", itemsQuery, "with params:", queryParams);
         const itemsResult = await db.query(itemsQuery, queryParams);
         const products = itemsResult.rows;
 
-        // --- Query to get the total count of items (for totalPages calculation) ---
-        // This count MUST reflect any filters applied to itemsQuery for accuracy
-        let countQuery = 'SELECT COUNT(*) AS total_items FROM products';
-        const countQueryParams = []; // Will hold values for $1, $2 for the count query
-        let countParamCount = 0; // Separate counter for count query params
+        // --- Count Query ---
+        let countQuery = `
+            SELECT COUNT(DISTINCT p.id) AS total_items 
+            FROM products p
+            JOIN suppliers s ON p.supplier_id = s.id
+        `;
+        const countQueryParams = []; // Parameters for the WHERE clause of count query
+        let countParamCountInternal = 0; // Separate counter for these params
+        let countWhereClauses = ["s.is_active = TRUE"];
 
-        // --- LATER: The SAME WHERE clauses for search and filters MUST be built here ---
-        // Example corresponding to category filter above:
-        // if (req.query.category) {
-        //     countQuery += (countParamCount === 0 ? ' WHERE' : ' AND') + ` category = $${++countParamCount}`;
-        //     countQueryParams.push(req.query.category);
+
+        // --- LATER: Add SAME other filters here ---
+        // if (categoryFilter) {
+        //     countWhereClauses.push(`p.category ILIKE $${++countParamCountInternal}`);
+        //     countQueryParams.push(`%${categoryFilter}%`);
         // }
 
-        // console.log("Executing countQuery:", countQuery, "with params:", countQueryParams);
-        const countResult = await db.query(countQuery, countQueryParams);
+        if (countWhereClauses.length > 0) {
+            countQuery += ' WHERE ' + countWhereClauses.join(' AND ');
+        }
+        
+        const countResult = await db.query(countQuery, countQueryParams); // Pass only filter params
         const totalItems = parseInt(countResult.rows[0].total_items, 10);
         const totalPages = Math.ceil(totalItems / safeLimit);
 
-        // Send the single, final paginated response
         res.json({
             items: products,
             currentPage: safePage,
@@ -438,11 +418,11 @@ app.get('/api/products', async (req, res) => { // Route handler starts
             limit: safeLimit
         });
 
-    } catch (err) { // Single catch block for any error within the try
+    } catch (err) {
         console.error("Error fetching products with pagination:", err);
         res.status(500).json({ error: 'Failed to fetch products' });
     }
-}); // Route handler ends
+});
 // server.js
 // ... (other require statements, middleware, existing /api/products route) ...
 // server.js
@@ -451,6 +431,8 @@ app.get('/api/products', async (req, res) => { // Route handler starts
 // --- NEW: GET multiple products by a list of IDs ---
 // Expects a comma-separated string of product IDs in a query parameter
 // e.g., /api/products/batch?ids=1,2,3,4
+// telegram-app-backend/server.js
+
 app.get('/api/products/batch', async (req, res) => {
     const idsString = req.query.ids;
 
@@ -458,16 +440,15 @@ app.get('/api/products/batch', async (req, res) => {
         return res.status(400).json({ error: 'Product IDs are required.' });
     }
 
-    // Convert comma-separated string to an array of integers
-    const productIds = idsString.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id) && id > 0);
+    const productIds = idsString.split(',')
+        .map(id => parseInt(id.trim(), 10))
+        .filter(id => !isNaN(id) && id > 0);
 
     if (productIds.length === 0) {
         return res.status(400).json({ error: 'No valid Product IDs provided.' });
     }
 
     try {
-        // Using ANY($1) with an array of IDs is efficient
-        // We also want to join with suppliers to get supplier_name, similar to single product detail
         const query = `
             SELECT 
                 p.id, 
@@ -482,24 +463,21 @@ app.get('/api/products/batch', async (req, res) => {
                 p.created_at,
                 p.supplier_id,
                 s.name AS supplier_name 
+                -- p.*, s.name AS supplier_name -- Simpler way to select all from p
             FROM products p
             LEFT JOIN suppliers s ON p.supplier_id = s.id
-            WHERE p.id = ANY($1::int[]); 
-            -- Optionally, preserve order of IDs if needed (more complex query or client-side sort)
-            -- For now, default database order for the matched IDs
+            WHERE p.id = ANY($1::int[]) 
+              AND s.is_active = TRUE; -- <<< MODIFIED: Only products from active suppliers
         `;
         // $1::int[] tells PostgreSQL to treat the parameter as an array of integers.
 
         const result = await db.query(query, [productIds]);
-
-        // The database might not return products in the same order as the input IDs.
-        // If order preservation is critical, you'd need to re-order them client-side
-        // or use a more complex SQL query with array_position or a JOIN with VALUES.
-        // For now, this is simpler.
+        
+        console.log(`[BATCH_PRODUCTS] Fetched ${result.rows.length} products for IDs: ${productIds.join(',')}, considering active suppliers.`);
         res.json(result.rows);
 
     } catch (err) {
-        console.error('Error fetching products by batch:', err);
+        console.error('[BATCH_PRODUCTS] Error fetching products by batch:', err);
         res.status(500).json({ error: 'Failed to fetch products by batch' });
     }
 });
@@ -936,6 +914,10 @@ app.delete('/api/cart/item/:productId', async (req, res) => {
 });
 
 // --- SUPPLIER AUTHENTICATION ---
+// Ensure bcrypt is required at the top: const bcrypt = require('bcrypt');
+// Ensure jwt is required: const jwt = require('jsonwebtoken');
+// Ensure db is available
+
 app.post('/api/auth/supplier/login', async (req, res) => {
     const { email, password } = req.body;
 
@@ -944,35 +926,45 @@ app.post('/api/auth/supplier/login', async (req, res) => {
     }
 
     try {
-        const supplierResult = await db.query('SELECT id, name, email, password_hash FROM suppliers WHERE email = $1', [email.toLowerCase()]);
+        // Fetch is_active along with other details
+        const supplierResult = await db.query(
+            'SELECT id, name, email, password_hash, is_active FROM suppliers WHERE email = $1', 
+            [email.toLowerCase().trim()] // Added trim()
+        );
 
         if (supplierResult.rows.length === 0) {
-            return res.status(401).json({ error: 'Invalid credentials.' }); // User not found
+            return res.status(401).json({ error: 'Invalid credentials.' });
         }
 
         const supplier = supplierResult.rows[0];
 
+        // --- NEW: Check if supplier is active ---
+        if (supplier.is_active === false) { // Explicitly check for false
+            console.log(`Supplier login attempt failed for inactive account: ${email}`);
+            return res.status(403).json({ error: 'Your account is currently suspended. Please contact support.' });
+        }
+        // --- END NEW ---
+
         const match = await bcrypt.compare(password, supplier.password_hash);
         if (!match) {
-            return res.status(401).json({ error: 'Invalid credentials.' }); // Password doesn't match
+            return res.status(401).json({ error: 'Invalid credentials.' });
         }
 
-        // Generate JWT
         const tokenPayload = {
             supplierId: supplier.id,
             name: supplier.name,
             email: supplier.email,
-            // Add other roles/permissions if needed later
         };
-        const token = jwt.sign(tokenPayload, process.env.JWT_SECRET, { expiresIn: '1d' }); // Token expires in 1 day
+        const token = jwt.sign(tokenPayload, process.env.JWT_SECRET, { expiresIn: '1d' });
 
         res.json({ 
             message: 'Login successful', 
             token,
-            supplier: { // Send back some supplier info for the frontend
+            supplier: {
                 id: supplier.id,
                 name: supplier.name,
                 email: supplier.email
+                // Do NOT send is_active or password_hash to client here
             }
         });
 
@@ -1346,125 +1338,100 @@ app.delete('/api/favorites/:productId', async (req, res) => {
 // server.js
 // ... (other require statements, middleware, existing routes) ...
 
+// telegram-app-backend/server.js
+
 app.get('/api/featured-items', async (req, res) => {
-    const SLIDER_ITEM_LIMIT = 5; // Max distinct feature definitions to initially fetch
-    console.log(`[NEW_FEATURED_API] Fetching up to ${SLIDER_ITEM_LIMIT} featured items.`);
+    const SLIDER_ITEM_LIMIT = 5;
+    console.log(`[FEATURED_API_V3] Fetching up to ${SLIDER_ITEM_LIMIT} featured items.`);
 
     try {
-        // 1. Fetch active feature definitions from the featured_items table
+        // Step 1: Get active feature definitions, already filtering by supplier status where possible
+        // This query is now more complex to pre-filter based on supplier activity.
         const featuredDefinitionsQuery = `
             SELECT 
-                id AS feature_definition_id, -- Alias to distinguish from item_id
-                item_type, 
-                item_id, 
-                custom_title, 
-                custom_description, 
-                custom_image_url
-            FROM featured_items
-            WHERE is_active = TRUE
-              AND (active_from IS NULL OR active_from <= NOW())
-              AND (active_until IS NULL OR active_until >= NOW())
-            ORDER BY display_order ASC, created_at DESC
+                fi.id AS feature_definition_id,
+                fi.item_type, 
+                fi.item_id, 
+                fi.custom_title, 
+                fi.custom_description, 
+                fi.custom_image_url
+            FROM featured_items fi
+            LEFT JOIN products p_check ON fi.item_type = 'product' AND fi.item_id = p_check.id
+            LEFT JOIN suppliers s_prod_check ON p_check.supplier_id = s_prod_check.id
+            LEFT JOIN suppliers s_supp_check ON fi.item_type = 'supplier' AND fi.item_id = s_supp_check.id
+            LEFT JOIN deals d_check ON fi.item_type = 'deal' AND fi.item_id = d_check.id
+            LEFT JOIN suppliers s_deal_check ON d_check.supplier_id = s_deal_check.id
+            WHERE fi.is_active = TRUE
+              AND (fi.active_from IS NULL OR fi.active_from <= NOW())
+              AND (fi.active_until IS NULL OR fi.active_until >= NOW())
+              AND (
+                    (fi.item_type = 'product' AND s_prod_check.is_active = TRUE) OR
+                    (fi.item_type = 'supplier' AND s_supp_check.is_active = TRUE) OR
+                    (fi.item_type = 'deal' AND (d_check.supplier_id IS NULL OR s_deal_check.is_active = TRUE)) OR
+                    (fi.item_type NOT IN ('product', 'supplier', 'deal')) -- For any other types not supplier-dependent
+                  )
+            ORDER BY fi.display_order ASC, fi.created_at DESC
             LIMIT $1;
         `;
         const featuredDefsResult = await db.query(featuredDefinitionsQuery, [SLIDER_ITEM_LIMIT]);
         const featureDefinitions = featuredDefsResult.rows;
 
-        console.log(`[NEW_FEATURED_API] Found ${featureDefinitions.length} active feature definitions.`);
+        console.log(`[FEATURED_API_V3] Found ${featureDefinitions.length} active feature definitions after initial supplier status filter.`);
 
         if (featureDefinitions.length === 0) {
             return res.json([]);
         }
 
-        // 2. Create an array of promises to fetch details for each item if needed
+        // Step 2: Hydration (same as before, but the input list is already pre-filtered)
         const hydrationPromises = featureDefinitions.map(async (definition) => {
+            // ... (keep your existing hydration logic from the last version of this endpoint)
+            // It will fetch details for product, deal, or supplier based on item_type
+            // The items it tries to hydrate are already confirmed to be from active suppliers (or platform deals/items)
+            // if they were product, supplier, or supplier-linked deal types.
             let title = definition.custom_title;
             let description = definition.custom_description;
             let imageUrl = definition.custom_image_url;
-            let originalItemData = {}; // To store type-specific original data
-
-            // Only fetch original item if custom data is missing for essential fields
+            let originalItemData = {}; 
             const needsHydration = !title || !description || !imageUrl;
 
             if (needsHydration) {
-                console.log(`[NEW_FEATURED_API] Hydrating feature: type=${definition.item_type}, item_id=${definition.item_id}`);
                 try {
                     let originalItemResult;
                     if (definition.item_type === 'product') {
-                        originalItemResult = await db.query(
-                            'SELECT name, description, image_url, price, discount_price, is_on_sale FROM products WHERE id = $1',
-                            [definition.item_id]
-                        );
-                        if (originalItemResult.rows.length > 0) {
-                            const p = originalItemResult.rows[0];
-                            title = title || p.name;
-                            description = description || p.description;
-                            imageUrl = imageUrl || p.image_url;
-                            originalItemData = { price: p.price, discount_price: p.discount_price, is_on_sale: p.is_on_sale };
-                        }
+                        originalItemResult = await db.query('SELECT name, description, image_url, price, discount_price, is_on_sale FROM products WHERE id = $1', [definition.item_id]);
+                        if (originalItemResult.rows.length > 0) { const p = originalItemResult.rows[0]; title = title || p.name; description = description || p.description; imageUrl = imageUrl || p.image_url; originalItemData = { price: p.price, discount_price: p.discount_price, is_on_sale: p.is_on_sale };}
                     } else if (definition.item_type === 'deal') {
-                        originalItemResult = await db.query(
-                            'SELECT title, description, image_url, discount_percentage, end_date FROM deals WHERE id = $1',
-                            [definition.item_id]
-                        );
-                        if (originalItemResult.rows.length > 0) {
-                            const d = originalItemResult.rows[0];
-                            title = title || d.title;
-                            description = description || d.description;
-                            imageUrl = imageUrl || d.image_url;
-                            originalItemData = { discount_percentage: d.discount_percentage, end_date: d.end_date };
-                        }
+                        originalItemResult = await db.query('SELECT title, description, image_url, discount_percentage, end_date FROM deals WHERE id = $1', [definition.item_id]);
+                        if (originalItemResult.rows.length > 0) { const d = originalItemResult.rows[0]; title = title || d.title; description = description || d.description; imageUrl = imageUrl || d.image_url; originalItemData = { discount_percentage: d.discount_percentage, end_date: d.end_date };}
                     } else if (definition.item_type === 'supplier') {
-                        originalItemResult = await db.query(
-                            'SELECT name, category, image_url, rating, location FROM suppliers WHERE id = $1',
-                            [definition.item_id]
-                        );
-                        if (originalItemResult.rows.length > 0) {
-                            const s = originalItemResult.rows[0];
-                            title = title || s.name;
-                            description = description || s.category; // Using category as description fallback
-                            imageUrl = imageUrl || s.image_url;
-                            originalItemData = { rating: s.rating, location: s.location };
-                        }
+                        originalItemResult = await db.query('SELECT name, category, image_url, rating, location FROM suppliers WHERE id = $1', [definition.item_id]);
+                        if (originalItemResult.rows.length > 0) { const s = originalItemResult.rows[0]; title = title || s.name; description = description || s.category; imageUrl = imageUrl || s.image_url; originalItemData = { rating: s.rating, location: s.location };}
                     }
                 } catch (hydrationError) {
-                    console.error(`[NEW_FEATURED_API] Error during hydration for item_id ${definition.item_id} (type ${definition.item_type}):`, hydrationError.message);
-                    // If hydration fails, we might still want to return the item if custom fields exist,
-                    // or mark it as errored to filter out later. For now, it will proceed with potentially null originalItemData.
+                    console.error(`[FEATURED_API_V3] Hydration error for item_id ${definition.item_id} (type ${definition.item_type}):`, hydrationError.message);
+                    return { ...definition, title: definition.custom_title || 'Error Loading', hydrationError: true };
                 }
-            } else {
-                 console.log(`[NEW_FEATURED_API] Using custom data for feature: type=${definition.item_type}, item_id=${definition.item_id}`);
-            }
-
-            // Construct the final item object
-            if (!title) { // If after custom and hydration, title is still missing, this item is invalid for display
-                console.warn(`[NEW_FEATURED_API] Item type=${definition.item_type}, id=${definition.item_id} has no title after hydration. Skipping.`);
-                return null; 
             }
             
+            if (!title) {
+                console.warn(`[FEATURED_API_V3] Item type=${definition.item_type}, id=${definition.item_id} has no title. Skipping.`);
+                return null; 
+            }
             return {
-                feature_definition_id: definition.feature_definition_id, // The ID from featured_items table
-                type: definition.item_type,
-                id: definition.item_id, // The ID of the product, deal, or supplier
-                title: title,
-                description: description,
-                imageUrl: imageUrl,
-                ...originalItemData // Spread product/deal/supplier specific fields
+                feature_definition_id: definition.feature_definition_id, type: definition.item_type, id: definition.item_id,
+                title, description, imageUrl, ...originalItemData
             };
         });
 
-        // 3. Wait for all hydration promises to resolve
         const hydratedItems = await Promise.all(hydrationPromises);
+        const finalValidItems = hydratedItems.filter(item => item !== null && !item.hydrationError);
 
-        // 4. Filter out any items that ended up being null (e.g., no title after hydration)
-        const finalValidItems = hydratedItems.filter(item => item !== null);
-
-        console.log(`[NEW_FEATURED_API] Sending ${finalValidItems.length} items to client.`);
-        console.log("[NEW_FEATURED_API] Data being sent:", JSON.stringify(finalValidItems, null, 2));
+        console.log(`[FEATURED_API_V3] Sending ${finalValidItems.length} items to client.`);
+        console.log("[FEATURED_API_V3] Data being sent:", JSON.stringify(finalValidItems, null, 2));
         res.json(finalValidItems);
 
     } catch (err) {
-        console.error("[NEW_FEATURED_API] General error in /api/featured-items:", err);
+        console.error("[FEATURED_API_V3] General error in /api/featured-items:", err);
         res.status(500).json({ error: 'Failed to fetch featured items' });
     }
 });
@@ -1908,7 +1875,45 @@ app.delete('/api/admin/suppliers/:supplierId', authAdmin, async (req, res) => {
         res.status(500).json({ error: 'Failed to delete supplier due to a server error.' });
     }
 });
+// telegram-app-backend/server.js
+// Ensure authAdmin is imported
 
+// PUT - Toggle active status of a supplier (Admin only)
+app.put('/api/admin/suppliers/:supplierId/toggle-active', authAdmin, async (req, res) => {
+    const { supplierId } = req.params;
+    const parsedSupplierId = parseInt(supplierId, 10);
+
+    if (isNaN(parsedSupplierId)) {
+        return res.status(400).json({ error: 'Invalid Supplier ID format.' });
+    }
+
+    try {
+        // Fetch the current status first
+        const currentSupplierResult = await db.query('SELECT id, name, email, is_active FROM suppliers WHERE id = $1', [parsedSupplierId]);
+
+        if (currentSupplierResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Supplier not found.' });
+        }
+
+        const currentStatus = currentSupplierResult.rows[0].is_active;
+        const newStatus = !currentStatus; // Toggle the status
+
+        const updateResult = await db.query(
+            'UPDATE suppliers SET is_active = $1, updated_at = NOW() WHERE id = $2 RETURNING id, name, email, category, location, rating, is_active, created_at', // Return relevant fields
+            [newStatus, parsedSupplierId]
+        );
+        
+        // updated_at assumes you have a trigger or are setting it manually. 
+        // If trigger exists, you can remove updated_at = NOW() from here.
+
+        console.log(`[ADMIN] Supplier ID ${parsedSupplierId} status toggled to ${newStatus} by admin ${req.admin.adminId}`);
+        res.status(200).json(updateResult.rows[0]); // Send back the updated supplier
+
+    } catch (err) {
+        console.error(`[ADMIN] Error toggling status for supplier ${parsedSupplierId}:`, err);
+        res.status(500).json({ error: 'Failed to update supplier status.' });
+    }
+});
 // ... (app.listen) ...
 // --- Start the Server ---
 app.listen(PORT, () => {
