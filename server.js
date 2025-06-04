@@ -2112,8 +2112,7 @@ app.put('/api/supplier/deals/:dealId', authSupplier, async (req, res) => {
                 end_date = $5,
                 product_id = $6,
                 image_url = $7,
-                is_active = $8,
-                updated_at = NOW() -- Assuming you have an updated_at column with trigger or set manually
+                is_active = $8
             WHERE id = $9 AND supplier_id = $10 -- Ensure supplier_id match again for safety
             RETURNING *;
         `;
