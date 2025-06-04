@@ -2033,6 +2033,156 @@ app.post('/api/supplier/deals', authSupplier, async (req, res) => {
     }
 });
 
+app.put('/api/supplier/deals/:dealId', authSupplier, async (req, res) => {
+    const supplierId = req.supplier.supplierId;
+    const { dealId } = req.params;
+    const parsedDealId = parseInt(dealId, 10);
+
+    const {
+        title,
+        description,
+        discount_percentage,
+        start_date,
+        end_date,
+        product_id, // Can be null to unlink, or a new product_id
+        image_url,
+        is_active
+    } = req.body;
+
+    // --- Validation ---
+    if (isNaN(parsedDealId)) {
+        return res.status(400).json({ error: 'Invalid Deal ID.' });
+    }
+    if (!title || title.trim() === '') {
+        return res.status(400).json({ error: 'Deal title is required.' });
+    }
+    // Add more validation for discount, dates, product_id format as in POST route
+    if (discount_percentage !== undefined && discount_percentage !== null && (isNaN(parseFloat(discount_percentage)) || parseFloat(discount_percentage) <= 0 || parseFloat(discount_percentage) > 100)) {
+        return res.status(400).json({ error: 'Discount percentage must be a number between 0 and 100 if provided.' });
+    }
+    if (start_date && end_date && new Date(start_date) >= new Date(end_date)) {
+        return res.status(400).json({ error: 'End date must be after start date.' });
+    }
+    if (product_id !== undefined && product_id !== null && product_id !== '' && isNaN(parseInt(product_id, 10))) {
+         return res.status(400).json({ error: 'Invalid product ID format.' });
+    }
+
+
+    const client = await db.pool.connect();
+    try {
+        await client.query('BEGIN'); // Start transaction
+
+        // 1. Verify the deal exists and belongs to this supplier
+        const dealCheckQuery = 'SELECT id, supplier_id, product_id AS old_product_id FROM deals WHERE id = $1';
+        const dealCheckResult = await client.query(dealCheckQuery, [parsedDealId]);
+
+        if (dealCheckResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(404).json({ error: 'Deal not found.' });
+        }
+        if (dealCheckResult.rows[0].supplier_id !== supplierId) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(403).json({ error: 'Forbidden: You do not own this deal.' });
+        }
+
+        // 2. If product_id is provided and is different from old one, verify new product belongs to supplier
+        const parsedProductId = product_id ? parseInt(product_id, 10) : null;
+        if (parsedProductId && parsedProductId !== dealCheckResult.rows[0].old_product_id) {
+            const productCheckQuery = 'SELECT id FROM products WHERE id = $1 AND supplier_id = $2';
+            const productCheckResult = await client.query(productCheckQuery, [parsedProductId, supplierId]);
+            if (productCheckResult.rows.length === 0) {
+                await client.query('ROLLBACK');
+                client.release();
+                return res.status(403).json({ error: 'Forbidden: The selected product for the deal does not belong to you or does not exist.' });
+            }
+        } else if (product_id === '' || product_id === null) {
+            // If product_id is explicitly set to empty or null, allow unlinking
+        }
+
+
+        // 3. Update the deal
+        const updateQuery = `
+            UPDATE deals SET
+                title = $1,
+                description = $2,
+                discount_percentage = $3,
+                start_date = $4,
+                end_date = $5,
+                product_id = $6,
+                image_url = $7,
+                is_active = $8,
+                updated_at = NOW() -- Assuming you have an updated_at column with trigger or set manually
+            WHERE id = $9 AND supplier_id = $10 -- Ensure supplier_id match again for safety
+            RETURNING *;
+        `;
+        const values = [
+            title.trim(),
+            description || null,
+            discount_percentage ? parseFloat(discount_percentage) : null,
+            start_date ? new Date(start_date) : null,
+            end_date ? new Date(end_date) : null,
+            parsedProductId, // Use parsed and validated product_id
+            image_url || null,
+            is_active === undefined ? true : Boolean(is_active),
+            parsedDealId,
+            supplierId
+        ];
+
+        const result = await client.query(updateQuery, values);
+        await client.query('COMMIT'); // Commit transaction
+        
+        console.log(`[SUPPLIER_DEALS] Deal ID ${parsedDealId} updated by supplier ${supplierId}`);
+        res.status(200).json(result.rows[0]);
+
+    } catch (err) {
+        await client.query('ROLLBACK'); // Rollback on error
+        console.error(`[SUPPLIER_DEALS] Error updating deal ${dealId} for supplier ${supplierId}:`, err);
+        res.status(500).json({ error: 'Failed to update deal.' });
+    } finally {
+        client.release();
+    }
+});
+
+app.delete('/api/supplier/deals/:dealId', authSupplier, async (req, res) => {
+    const supplierId = req.supplier.supplierId;
+    const { dealId } = req.params;
+    const parsedDealId = parseInt(dealId, 10);
+
+    if (isNaN(parsedDealId)) {
+        return res.status(400).json({ error: 'Invalid Deal ID.' });
+    }
+
+    try {
+        // Verify ownership before deleting
+        const dealCheckQuery = 'SELECT id FROM deals WHERE id = $1 AND supplier_id = $2';
+        const dealCheckResult = await db.query(dealCheckQuery, [parsedDealId, supplierId]);
+
+        if (dealCheckResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Deal not found or you do not own this deal.' });
+        }
+
+        // Delete the deal
+        const deleteQuery = 'DELETE FROM deals WHERE id = $1 RETURNING id;'; // Only need id for confirmation
+        const result = await db.query(deleteQuery, [parsedDealId]);
+
+        if (result.rowCount === 0) { // Should not happen if above check passed
+            return res.status(404).json({ error: 'Deal not found during delete attempt.' });
+        }
+        
+        console.log(`[SUPPLIER_DEALS] Deal ID ${parsedDealId} deleted by supplier ${supplierId}`);
+        res.status(200).json({ message: 'Deal deleted successfully', deletedDealId: parsedDealId });
+
+    } catch (err) {
+        console.error(`[SUPPLIER_DEALS] Error deleting deal ${dealId} for supplier ${supplierId}:`, err);
+        // Check for foreign key constraints if deals are referenced elsewhere (e.g., featured_items)
+        if (err.code === '23503') { // Foreign key violation
+             return res.status(409).json({ error: 'Cannot delete this deal as it is currently featured or referenced elsewhere. Please remove it from features first.' });
+        }
+        res.status(500).json({ error: 'Failed to delete deal.' });
+    }
+});
 
 // TODO LATER:
 // PUT /api/supplier/deals/:dealId (authSupplier) - for editing
