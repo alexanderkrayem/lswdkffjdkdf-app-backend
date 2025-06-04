@@ -1914,6 +1914,129 @@ app.put('/api/admin/suppliers/:supplierId/toggle-active', authAdmin, async (req,
         res.status(500).json({ error: 'Failed to update supplier status.' });
     }
 });
+
+// telegram-app-backend/server.js
+// Ensure authSupplier middleware is imported: const authSupplier = require('./middleware/authSupplier');
+// Ensure db object is available: const db = require('./config/db');
+
+// ... (existing supplier routes for products, auth) ...
+
+
+// --- SUPPLIER DEAL MANAGEMENT ---
+
+// GET all deals for the authenticated supplier
+app.get('/api/supplier/deals', authSupplier, async (req, res) => {
+    const supplierId = req.supplier.supplierId;
+
+    try {
+        // Fetch deals created by this supplier
+        // Also join with products if product_id is present to get product_name
+        const query = `
+            SELECT 
+                d.id, d.title, d.description, d.discount_percentage,
+                d.start_date, d.end_date, d.product_id, p.name as product_name,
+                d.image_url, d.is_active, d.created_at
+            FROM deals d
+            LEFT JOIN products p ON d.product_id = p.id AND p.supplier_id = d.supplier_id -- Ensure product also belongs to supplier
+            WHERE d.supplier_id = $1
+            ORDER BY d.created_at DESC;
+        `;
+        // TODO: Add pagination if a supplier can have many deals
+
+        const result = await db.query(query, [supplierId]);
+        res.json(result.rows);
+
+    } catch (err) {
+        console.error(`[SUPPLIER_DEALS] Error fetching deals for supplier ${supplierId}:`, err);
+        res.status(500).json({ error: 'Failed to fetch deals.' });
+    }
+});
+
+
+// POST - Create a new deal for the authenticated supplier
+app.post('/api/supplier/deals', authSupplier, async (req, res) => {
+    const supplierId = req.supplier.supplierId;
+    const {
+        title,
+        description,
+        discount_percentage, // Can be null
+        start_date,          // Can be null (starts immediately if active)
+        end_date,            // Can be null (no expiry)
+        product_id,          // Can be null (deal not tied to a specific product)
+        image_url,           // Can be null
+        is_active = true     // Default to active, or could be false for "draft"
+    } = req.body;
+
+    // --- Validation ---
+    if (!title || title.trim() === '') {
+        return res.status(400).json({ error: 'Deal title is required.' });
+    }
+    if (discount_percentage !== undefined && discount_percentage !== null && (isNaN(parseFloat(discount_percentage)) || parseFloat(discount_percentage) <= 0 || parseFloat(discount_percentage) > 100)) {
+        return res.status(400).json({ error: 'Discount percentage must be a number between 0 and 100 if provided.' });
+    }
+    // Basic date validation (can be more robust)
+    if (start_date && isNaN(new Date(start_date).getTime())) {
+        return res.status(400).json({ error: 'Invalid start date format.' });
+    }
+    if (end_date && isNaN(new Date(end_date).getTime())) {
+        return res.status(400).json({ error: 'Invalid end date format.' });
+    }
+    if (start_date && end_date && new Date(start_date) >= new Date(end_date)) {
+        return res.status(400).json({ error: 'End date must be after start date.' });
+    }
+    if (product_id !== undefined && product_id !== null && isNaN(parseInt(product_id, 10))) {
+        return res.status(400).json({ error: 'Invalid product ID format.' });
+    }
+
+    const client = await db.pool.connect(); // Use client for transaction if product check is complex
+
+    try {
+        // If product_id is provided, verify it belongs to this supplier
+        if (product_id) {
+            const productCheckQuery = 'SELECT id FROM products WHERE id = $1 AND supplier_id = $2';
+            const productCheckResult = await client.query(productCheckQuery, [parseInt(product_id, 10), supplierId]);
+            if (productCheckResult.rows.length === 0) {
+                client.release();
+                return res.status(403).json({ error: 'Forbidden: The selected product does not belong to you or does not exist.' });
+            }
+        }
+
+        const insertQuery = `
+            INSERT INTO deals (
+                title, description, discount_percentage, start_date, end_date, 
+                product_id, supplier_id, image_url, is_active
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING *;
+        `;
+        const values = [
+            title.trim(),
+            description || null,
+            discount_percentage ? parseFloat(discount_percentage) : null,
+            start_date ? new Date(start_date) : null,
+            end_date ? new Date(end_date) : null,
+            product_id ? parseInt(product_id, 10) : null,
+            supplierId, // Set automatically from authenticated supplier
+            image_url || null,
+            is_active === undefined ? true : Boolean(is_active)
+        ];
+
+        const result = await client.query(insertQuery, values);
+        
+        console.log(`[SUPPLIER_DEALS] Deal created by supplier ${supplierId}:`, result.rows[0].id);
+        res.status(201).json(result.rows[0]);
+
+    } catch (err) {
+        console.error(`[SUPPLIER_DEALS] Error creating deal for supplier ${supplierId}:`, err);
+        res.status(500).json({ error: 'Failed to create deal.' });
+    } finally {
+        client.release();
+    }
+});
+
+
+// TODO LATER:
+// PUT /api/supplier/deals/:dealId (authSupplier) - for editing
+// DELETE /api/supplier/deals/:dealId (authSupplier) - for deleting
 // ... (app.listen) ...
 // --- Start the Server ---
 app.listen(PORT, () => {
