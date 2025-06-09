@@ -2183,6 +2183,333 @@ app.delete('/api/supplier/deals/:dealId', authSupplier, async (req, res) => {
     }
 });
 
+// telegram-app-backend/server.js
+// Ensure authAdmin middleware is imported
+
+// --- ADMIN FEATURED ITEMS MANAGEMENT ---
+
+// GET all featured item definitions for Admin (includes inactive/scheduled)
+app.get('/api/admin/featured-items-definitions', authAdmin, async (req, res) => {
+    // Basic pagination (can be enhanced)
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 15;
+    const offset = (page - 1) * limit;
+
+    try {
+        const itemsQuery = `
+            SELECT 
+                fi.id AS feature_definition_id, 
+                fi.item_type, 
+                fi.item_id, 
+                fi.display_order,
+                fi.custom_title, 
+                fi.custom_description, 
+                fi.custom_image_url,
+                fi.is_active, 
+                fi.active_from, 
+                fi.active_until, 
+                fi.created_at,
+                CASE
+                    WHEN fi.item_type = 'product' THEN p.name
+                    WHEN fi.item_type = 'deal' THEN d.title
+                    WHEN fi.item_type = 'supplier' THEN s.name
+                    ELSE NULL
+                END AS original_item_name,
+                CASE
+                    WHEN fi.item_type = 'product' THEN p.image_url
+                    WHEN fi.item_type = 'deal' THEN d.image_url
+                    WHEN fi.item_type = 'supplier' THEN s.image_url
+                    ELSE NULL
+                END AS original_item_image_url
+            FROM featured_items fi
+            LEFT JOIN products p ON fi.item_type = 'product' AND fi.item_id = p.id
+            LEFT JOIN deals d ON fi.item_type = 'deal' AND fi.item_id = d.id
+            LEFT JOIN suppliers s ON fi.item_type = 'supplier' AND fi.item_id = s.id
+            ORDER BY fi.display_order ASC, fi.created_at DESC
+            LIMIT $1 OFFSET $2;
+        `;
+        const itemsResult = await db.query(itemsQuery, [limit, offset]);
+
+        const countQuery = 'SELECT COUNT(*) AS total_items FROM featured_items;';
+        const countResult = await db.query(countQuery);
+        const totalItems = parseInt(countResult.rows[0].total_items, 10);
+        const totalPages = Math.ceil(totalItems / limit);
+
+        res.json({
+            items: itemsResult.rows,
+            currentPage: page,
+            totalPages: totalPages,
+            totalItems: totalItems,
+        });
+
+    } catch (err) {
+        console.error("[ADMIN_FEATURED] Error fetching featured item definitions:", err);
+        res.status(500).json({ error: 'Failed to fetch featured item definitions.' });
+    }
+});
+
+// telegram-app-backend/server.js
+
+app.post('/api/admin/featured-items', authAdmin, async (req, res) => {
+    const {
+        item_type,
+        item_id,
+        display_order = 0, // Default display order
+        custom_title,
+        custom_description,
+        custom_image_url,
+        is_active = true,
+        active_from,
+        active_until
+    } = req.body;
+
+    // --- Validation ---
+    if (!item_type || !['product', 'deal', 'supplier'].includes(item_type)) {
+        return res.status(400).json({ error: 'Valid item_type (product, deal, supplier) is required.' });
+    }
+    if (item_id === undefined || item_id === null || isNaN(parseInt(item_id, 10))) {
+        return res.status(400).json({ error: 'Valid item_id is required.' });
+    }
+    if (display_order !== undefined && isNaN(parseInt(display_order, 10))) {
+        return res.status(400).json({ error: 'Display order must be a number.' });
+    }
+    // Add more validation for dates if provided
+
+    const parsedItemId = parseInt(item_id, 10);
+
+    const client = await db.pool.connect();
+    try {
+        await client.query('BEGIN'); // Start transaction
+
+        // Validate that the item_id exists in the respective table
+        let itemExistsQuery = '';
+        if (item_type === 'product') itemExistsQuery = 'SELECT id FROM products WHERE id = $1';
+        else if (item_type === 'deal') itemExistsQuery = 'SELECT id FROM deals WHERE id = $1';
+        else if (item_type === 'supplier') itemExistsQuery = 'SELECT id FROM suppliers WHERE id = $1';
+        
+        const itemExistsResult = await client.query(itemExistsQuery, [parsedItemId]);
+        if (itemExistsResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(404).json({ error: `The specified ${item_type} with ID ${parsedItemId} does not exist.` });
+        }
+
+        const insertQuery = `
+            INSERT INTO featured_items (
+                item_type, item_id, display_order, custom_title, custom_description,
+                custom_image_url, is_active, active_from, active_until
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING *;
+        `;
+        const values = [
+            item_type, parsedItemId, parseInt(display_order, 10),
+            custom_title || null, custom_description || null, custom_image_url || null,
+            is_active === undefined ? true : Boolean(is_active),
+            active_from ? new Date(active_from) : null,
+            active_until ? new Date(active_until) : null
+        ];
+
+        const result = await client.query(insertQuery, values);
+        await client.query('COMMIT'); // Commit transaction
+        
+        console.log(`[ADMIN_FEATURED] New featured item created by admin ${req.admin.adminId}: ID ${result.rows[0].id}`);
+        res.status(201).json(result.rows[0]);
+
+    } catch (err) {
+        await client.query('ROLLBACK'); // Rollback on error
+        console.error("[ADMIN_FEATURED] Error creating featured item:", err);
+        res.status(500).json({ error: 'Failed to create featured item.' });
+    } finally {
+        client.release();
+    }
+});
+
+
+
+// telegram-app-backend/server.js
+
+app.get('/api/admin/featured-items-definitions/:featureId', authAdmin, async (req, res) => {
+    const { featureId } = req.params;
+    const parsedFeatureId = parseInt(featureId, 10);
+
+    if (isNaN(parsedFeatureId)) {
+        return res.status(400).json({ error: 'Invalid Feature Definition ID format.' });
+    }
+
+    try {
+        // Similar to the list query, but for a single ID.
+        // We still join to get original item name for context if custom_title is null.
+        const query = `
+            SELECT 
+                fi.id AS feature_definition_id, 
+                fi.item_type, 
+                fi.item_id, 
+                fi.display_order,
+                fi.custom_title, 
+                fi.custom_description, 
+                fi.custom_image_url,
+                fi.is_active, 
+                fi.active_from, 
+                fi.active_until, 
+                fi.created_at,
+                CASE
+                    WHEN fi.item_type = 'product' THEN p.name
+                    WHEN fi.item_type = 'deal' THEN d.title
+                    WHEN fi.item_type = 'supplier' THEN s.name
+                    ELSE NULL
+                END AS original_item_name 
+            FROM featured_items fi
+            LEFT JOIN products p ON fi.item_type = 'product' AND fi.item_id = p.id
+            LEFT JOIN deals d ON fi.item_type = 'deal' AND fi.item_id = d.id
+            LEFT JOIN suppliers s ON fi.item_type = 'supplier' AND fi.item_id = s.id
+            WHERE fi.id = $1;
+        `;
+        const result = await db.query(query, [parsedFeatureId]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Featured item definition not found.' });
+        }
+        res.json(result.rows[0]);
+
+    } catch (err) {
+        console.error(`[ADMIN_FEATURED] Error fetching feature definition ID ${parsedFeatureId}:`, err);
+        res.status(500).json({ error: 'Failed to fetch feature definition.' });
+    }
+});
+
+// telegram-app-backend/server.js
+
+app.put('/api/admin/featured-items-definitions/:featureId', authAdmin, async (req, res) => {
+    const { featureId } = req.params;
+    const parsedFeatureId = parseInt(featureId, 10);
+
+    const {
+        item_type, // Usually not changed, but could be allowed
+        item_id,
+        display_order,
+        custom_title,
+        custom_description,
+        custom_image_url,
+        is_active,
+        active_from,
+        active_until
+    } = req.body;
+
+    if (isNaN(parsedFeatureId)) {
+        return res.status(400).json({ error: 'Invalid Feature Definition ID format.' });
+    }
+
+    // --- Validation (similar to POST, but some fields might be optional for PUT) ---
+    if (item_type && !['product', 'deal', 'supplier'].includes(item_type)) {
+        return res.status(400).json({ error: 'If provided, item_type must be product, deal, or supplier.' });
+    }
+    if (item_id !== undefined && (item_id === null || isNaN(parseInt(item_id, 10)))) {
+        return res.status(400).json({ error: 'If provided, item_id must be a valid number.' });
+    }
+    // Add more specific validations as needed...
+
+    const client = await db.pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Check if the feature definition exists
+        const existingFeature = await client.query('SELECT * FROM featured_items WHERE id = $1', [parsedFeatureId]);
+        if (existingFeature.rows.length === 0) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(404).json({ error: 'Feature definition not found to update.' });
+        }
+
+        const current = existingFeature.rows[0];
+        const newItemType = item_type || current.item_type;
+        const newItemId = (item_id !== undefined && item_id !== null) ? parseInt(item_id, 10) : current.item_id;
+
+        // If item_id or item_type is being changed, validate the new linked item
+        if ((item_id !== undefined && item_id !== null && newItemId !== current.item_id) || (item_type && newItemType !== current.item_type)) {
+            let itemExistsQuery = '';
+            if (newItemType === 'product') itemExistsQuery = 'SELECT id FROM products WHERE id = $1';
+            else if (newItemType === 'deal') itemExistsQuery = 'SELECT id FROM deals WHERE id = $1';
+            else if (newItemType === 'supplier') itemExistsQuery = 'SELECT id FROM suppliers WHERE id = $1';
+            
+            const itemExistsResult = await client.query(itemExistsQuery, [newItemId]);
+            if (itemExistsResult.rows.length === 0) {
+                await client.query('ROLLBACK');
+                client.release();
+                return res.status(404).json({ error: `The specified new ${newItemType} with ID ${newItemId} does not exist.` });
+            }
+        }
+
+        const updateQuery = `
+            UPDATE featured_items SET
+                item_type = $1,
+                item_id = $2,
+                display_order = $3,
+                custom_title = $4,
+                custom_description = $5,
+                custom_image_url = $6,
+                is_active = $7,
+                active_from = $8,
+                active_until = $9,
+                updated_at = NOW() -- Assuming you have an updated_at column and trigger
+            WHERE id = $10
+            RETURNING *;
+        `;
+        const values = [
+            newItemType,
+            newItemId,
+            display_order !== undefined ? parseInt(display_order, 10) : current.display_order,
+            custom_title !== undefined ? custom_title : current.custom_title, // Allow sending null to clear
+            custom_description !== undefined ? custom_description : current.custom_description,
+            custom_image_url !== undefined ? custom_image_url : current.custom_image_url,
+            is_active !== undefined ? Boolean(is_active) : current.is_active,
+            active_from !== undefined ? (active_from ? new Date(active_from) : null) : current.active_from,
+            active_until !== undefined ? (active_until ? new Date(active_until) : null) : current.active_until,
+            parsedFeatureId
+        ];
+
+        const result = await client.query(updateQuery, values);
+        await client.query('COMMIT');
+        
+        console.log(`[ADMIN_FEATURED] Featured item definition ID ${parsedFeatureId} updated by admin ${req.admin.adminId}`);
+        res.status(200).json(result.rows[0]);
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(`[ADMIN_FEATURED] Error updating feature definition ID ${parsedFeatureId}:`, err);
+        res.status(500).json({ error: 'Failed to update feature definition.' });
+    } finally {
+        client.release();
+    }
+});
+
+// telegram-app-backend/server.js
+
+app.delete('/api/admin/featured-items-definitions/:featureId', authAdmin, async (req, res) => {
+    const { featureId } = req.params;
+    const parsedFeatureId = parseInt(featureId, 10);
+
+    if (isNaN(parsedFeatureId)) {
+        return res.status(400).json({ error: 'Invalid Feature Definition ID format.' });
+    }
+
+    try {
+        const deleteQuery = 'DELETE FROM featured_items WHERE id = $1 RETURNING id;';
+        const result = await db.query(deleteQuery, [parsedFeatureId]);
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Featured item definition not found to delete.' });
+        }
+
+        console.log(`[ADMIN_FEATURED] Featured item definition ID ${parsedFeatureId} deleted by admin ${req.admin.adminId}`);
+        res.status(200).json({ message: 'Featured item definition deleted successfully.', deletedFeatureId: parsedFeatureId });
+        // Or res.sendStatus(204) for no content
+
+    } catch (err) {
+        console.error(`[ADMIN_FEATURED] Error deleting feature definition ID ${parsedFeatureId}:`, err);
+        res.status(500).json({ error: 'Failed to delete feature definition.' });
+    }
+});
+
 // TODO LATER:
 // PUT /api/supplier/deals/:dealId (authSupplier) - for editing
 // DELETE /api/supplier/deals/:dealId (authSupplier) - for deleting
