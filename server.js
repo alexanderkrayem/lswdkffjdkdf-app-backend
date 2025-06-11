@@ -1011,11 +1011,14 @@ app.post('/api/auth/supplier/login', async (req, res) => {
 // POST - Create a new product for the authenticated supplier
 // telegram-app-backend/server.js
 
+// telegram-app-backend/server.js
+// Ensure normalizeTextForMatching function is defined at the top of your file
+
 app.post('/api/supplier/products', authSupplier, async (req, res) => {
     const supplierId = req.supplier.supplierId;
     const { 
-        name,           // User-friendly display name
-        standardized_name_input, // What supplier enters as the "official" name
+        name, 
+        standardized_name_input, 
         description, 
         price, 
         discount_price,
@@ -1025,98 +1028,116 @@ app.post('/api/supplier/products', authSupplier, async (req, res) => {
         stock_level 
     } = req.body;
 
-    // --- Validation ---
-    if (!name || name.trim() === '') {
-        return res.status(400).json({ error: 'Display name is required.' });
-    }
-    if (!standardized_name_input || standardized_name_input.trim() === '') { // New required field
-        return res.status(400).json({ error: 'Standardized product name (from packaging) is required.' });
-    }
-    if (!price || isNaN(parseFloat(price)) || parseFloat(price) < 0) {
-         return res.status(400).json({ error: 'Valid price is required.' });
-    }
-    if (!category || category.trim() === '') {
-        return res.status(400).json({ error: 'Category is required.' });
-    }
-    // Add other validations for discount_price, stock_level if needed...
+    // --- Validation --- (Keep your existing validations)
+    if (!name || name.trim() === '') return res.status(400).json({ error: 'Display name is required.' });
+    if (!standardized_name_input || standardized_name_input.trim() === '') return res.status(400).json({ error: 'Standardized product name is required.' });
+    if (!price || isNaN(parseFloat(price)) || parseFloat(price) < 0) return res.status(400).json({ error: 'Valid price is required.' });
+    if (!category || category.trim() === '') return res.status(400).json({ error: 'Category is required.' });
+    // ... other validations ...
 
-
-    const client = await db.pool.connect(); // Use client for transaction
+    const client = await db.pool.connect();
     try {
         await client.query('BEGIN');
 
-        const normalizedSupplierInputName = normalizeTextForMatching(standardized_name_input);
-        let masterProductId = null;
-        let linkingStatus = 'pending'; // Default status
-        const similarityThreshold = 0.7; // Tune this threshold (0.0 to 1.0)
+        const normalizedSupplierStandardName = normalizeTextForMatching(standardized_name_input);
+        let masterProductIdToLink;
+        let linkingStatus;
+        const similarityThreshold = 0.7; // Tune this!
 
-        if (normalizedSupplierInputName) {
-            // Attempt to find a matching master product using trigram similarity on normalized names
-            // The master_products.standardized_name_normalized column should be indexed with GIN trigram ops
-            const matchQuery = `
+        // 1. Attempt to find an existing master product
+        if (normalizedSupplierStandardName) {
+            const matchMasterQuery = `
                 SELECT id, similarity(standardized_name_normalized, $1) AS sim
                 FROM master_products
+                WHERE similarity(standardized_name_normalized, $1) >= $2
                 ORDER BY sim DESC
                 LIMIT 1; 
             `;
-            // We use PostgreSQL's normalize_text for the column value, 
-            // and JS normalizeTextForMatching for the input value.
-            // For best results, ensure the normalization is as close as possible.
-            // Or, pass the raw supplier input and let PG normalize it in the query:
-            // WHERE similarity(normalize_text(standardized_name_normalized), normalize_text($1)) > threshold
-            // However, indexing normalize_text(standardized_name_normalized) is complex.
-            // So, we rely on standardized_name_normalized already being normalized in DB.
+            const masterMatchResult = await client.query(matchMasterQuery, [normalizedSupplierStandardName, similarityThreshold]);
 
-            const matchesResult = await client.query(matchQuery, [normalizedSupplierInputName]);
-
-            if (matchesResult.rows.length > 0 && matchesResult.rows[0].sim >= similarityThreshold) {
-                masterProductId = matchesResult.rows[0].id;
+            if (masterMatchResult.rows.length > 0) {
+                masterProductIdToLink = masterMatchResult.rows[0].id;
                 linkingStatus = 'automatically_linked';
-                console.log(`[SUPPLIER_PRODUCT_ADD] Product auto-linked to master_product_id ${masterProductId} with similarity ${matchesResult.rows[0].sim}`);
-            } else {
-                linkingStatus = 'needs_admin_review';
-                console.log(`[SUPPLIER_PRODUCT_ADD] No strong match found for master product. Status set to 'needs_admin_review'. Top similarity: ${matchesResult.rows.length > 0 ? matchesResult.rows[0].sim : 'N/A'}`);
+                console.log(`[PRODUCT_GROUPING] Auto-linking to existing master_product_id: ${masterProductIdToLink} for input: "${standardized_name_input}"`);
             }
-        } else {
-            linkingStatus = 'needs_admin_review'; // If no standardized name provided, needs review
         }
 
-        const insertQuery = `
+        // 2. If no strong match found, create a new master_product
+        if (!masterProductIdToLink && normalizedSupplierStandardName) {
+            console.log(`[PRODUCT_GROUPING] No strong master match for "${standardized_name_input}". Creating new master product.`);
+            const createMasterQuery = `
+                INSERT INTO master_products (
+                    standardized_name_normalized, 
+                    display_name, 
+                    description, 
+                    image_url, 
+                    brand,  -- Assuming category might contain brand info or you have separate field
+                    category,
+                    base_platform_price -- Set initial platform price, perhaps from supplier's price
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id;
+            `;
+            // Use supplier's input for initial master product details
+            // Consider if 'brand' should be extracted or a separate field
+            const masterValues = [
+                normalizedSupplierStandardName,
+                name.trim(), // Use supplier's display name as initial display_name
+                description || null,
+                image_url || null,
+                null, // Placeholder for brand, extract if possible
+                category.trim(),
+                parseFloat(price) // Initial base price from this first supplier's listing
+            ];
+            const newMasterResult = await client.query(createMasterQuery, masterValues);
+            masterProductIdToLink = newMasterResult.rows[0].id;
+            linkingStatus = 'auto_master_created'; // New status
+            console.log(`[PRODUCT_GROUPING] New master_product_id created: ${masterProductIdToLink}`);
+        } else if (!normalizedSupplierStandardName) {
+            // If supplier didn't provide a standardized name, it needs admin review to be grouped
+            linkingStatus = 'needs_admin_review';
+            masterProductIdToLink = null; // Cannot link without a standardized name
+            console.log(`[PRODUCT_GROUPING] No standardized_name_input provided. Status: 'needs_admin_review'`);
+        }
+
+
+        // 3. Insert the supplier's product, linking to the master_product_id
+        const insertProductQuery = `
             INSERT INTO products (
                 supplier_id, name, standardized_name_input, description, price, 
                 discount_price, category, image_url, is_on_sale, stock_level,
                 master_product_id, linking_status, created_at, updated_at 
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW()
-            ) RETURNING *;
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())
+            RETURNING *;
         `;
-        const values = [
-            supplierId,
-            name.trim(),
-            standardized_name_input, // Store the raw input from supplier
-            description || null,
-            parseFloat(price),
-            discount_price ? parseFloat(discount_price) : null,
-            category.trim(),
-            image_url || null,
+        const productValues = [
+            supplierId, name.trim(), standardized_name_input, description || null,
+            parseFloat(price), discount_price ? parseFloat(discount_price) : null,
+            category.trim(), image_url || null,
             is_on_sale === undefined ? false : Boolean(is_on_sale),
             stock_level ? parseInt(stock_level, 10) : 0,
-            masterProductId, // Can be null
+            masterProductIdToLink, // This will be NULL if no standardized name was provided or if master creation failed (though latter would error)
             linkingStatus
         ];
 
-        const result = await client.query(insertQuery, values);
+        const productResult = await client.query(insertProductQuery, productValues);
         await client.query('COMMIT');
         
-        console.log(`[SUPPLIER_PRODUCT_ADD] Product created by supplier ${supplierId}: ID ${result.rows[0].id}, Linking Status: ${linkingStatus}`);
-        res.status(201).json(result.rows[0]);
+        console.log(`[SUPPLIER_PRODUCT_ADD] Product ${productResult.rows[0].id} created by supplier ${supplierId}. Linked to master: ${masterProductIdToLink}, Status: ${linkingStatus}`);
+        res.status(201).json(productResult.rows[0]);
 
     } catch (err) {
-        await client.query('ROLLBACK');
+        if (client) await client.query('ROLLBACK'); // Ensure rollback if client was connected
         console.error(`[SUPPLIER_PRODUCT_ADD] Error creating product for supplier ${supplierId}:`, err);
+        if (err.constraint === 'master_products_standardized_name_normalized_key' && err.code === '23505') {
+            // This can happen in a race condition if two suppliers add the "same" new product simultaneously
+            // or if our initial check missed an identical normalized name.
+            // A more robust solution would re-query for the existing master_product_id based on the conflicting name.
+             console.error("[PRODUCT_GROUPING] Unique constraint violation on master_products.standardized_name_normalized. This might indicate a race condition or a missed match.");
+             return res.status(409).json({ error: 'A master product with this standardized name already exists. The system may need a moment to link, or please try a slightly different standardized name if this is a distinct product.' });
+        }
         res.status(500).json({ error: 'Failed to create product.' });
     } finally {
-        client.release();
+        if (client) client.release();
     }
 });
 // server.js
@@ -1130,147 +1151,118 @@ app.post('/api/supplier/products', authSupplier, async (req, res) => {
 // PUT - Update an existing product for the authenticated supplier
 // telegram-app-backend/server.js
 
+// telegram-app-backend/server.js
+
 app.put('/api/supplier/products/:productId', authSupplier, async (req, res) => {
     const supplierId = req.supplier.supplierId;
     const { productId } = req.params;
     const {
-        name,
-        standardized_name_input, // Potentially updated by supplier
-        description,
-        price,
-        discount_price,
-        category,
-        image_url,
-        is_on_sale,
-        stock_level
+        name, standardized_name_input, description, price, discount_price,
+        category, image_url, is_on_sale, stock_level
     } = req.body;
 
     const parsedProductId = parseInt(productId, 10);
-    // --- Basic Validation (ensure all necessary fields are present if being updated) ---
+    // --- Validation (Keep your existing validations) ---
+    // ... ensure all required fields are present, especially name and standardized_name_input ...
     if (isNaN(parsedProductId)) return res.status(400).json({ error: 'Invalid Product ID.' });
-    if (!name || name.trim() === '') return res.status(400).json({ error: 'Display name required.'});
-    if (!standardized_name_input || standardized_name_input.trim() === '') return res.status(400).json({ error: 'Standardized name required.'});
-    // Add other validations as per POST...
+    if (!name || !standardized_name_input /* ... other checks ... */) {
+        return res.status(400).json({ error: 'Required fields are missing or invalid.' });
+    }
+
 
     const client = await db.pool.connect();
     try {
         await client.query('BEGIN');
 
-        // 1. Verify ownership
-        const ownerResult = await client.query('SELECT supplier_id, standardized_name_input AS old_standardized_name FROM products WHERE id = $1', [parsedProductId]);
-        if (ownerResult.rows.length === 0) {
+        // 1. Verify ownership and get current product data
+        const productCheckResult = await client.query(
+            'SELECT supplier_id, master_product_id, linking_status, standardized_name_input AS old_standardized_name FROM products WHERE id = $1',
+            [parsedProductId]
+        );
+        if (productCheckResult.rows.length === 0) {
             await client.query('ROLLBACK'); client.release();
             return res.status(404).json({ error: 'Product not found.' });
         }
-        if (ownerResult.rows[0].supplier_id !== supplierId) {
+        const currentProduct = productCheckResult.rows[0];
+        if (currentProduct.supplier_id !== supplierId) {
             await client.query('ROLLBACK'); client.release();
             return res.status(403).json({ error: 'Forbidden: You do not own this product.' });
         }
-        const oldStandardizedName = ownerResult.rows[0].old_standardized_name;
 
-        // 2. Handle master product linking if standardized_name_input has changed
-        let masterProductIdToSet = null; // Keep existing link by default if name doesn't change
-        let linkingStatusToSet = null;   // Keep existing status by default
+        let masterProductIdToSet = currentProduct.master_product_id;
+        let linkingStatusToSet = currentProduct.linking_status;
+        const normalizedNewStandardName = normalizeTextForMatching(standardized_name_input);
+        const normalizedOldStandardName = normalizeTextForMatching(currentProduct.old_standardized_name);
 
-        const normalizedNewStandardizedName = normalizeTextForMatching(standardized_name_input);
-        const normalizedOldStandardizedName = normalizeTextForMatching(oldStandardizedName);
-
-        // Only re-evaluate master product link if the standardized name input has actually changed
-        if (normalizedNewStandardizedName && normalizedNewStandardizedName !== normalizedOldStandardizedName) {
-            console.log(`[SUPPLIER_PRODUCT_UPDATE] Standardized name changed for product ${parsedProductId}. Re-evaluating master link.`);
+        // 2. Re-evaluate master product link if standardized_name_input has changed significantly
+        if (normalizedNewStandardName && normalizedNewStandardName !== normalizedOldStandardName) {
+            console.log(`[PRODUCT_GROUPING_UPDATE] Standardized name changed for product ${parsedProductId}. Re-evaluating master link.`);
             const similarityThreshold = 0.7;
-            const matchQuery = `
+            const matchMasterQuery = `
                 SELECT id, similarity(standardized_name_normalized, $1) AS sim
                 FROM master_products
-                ORDER BY sim DESC
-                LIMIT 1;
+                WHERE similarity(standardized_name_normalized, $1) >= $2
+                ORDER BY sim DESC LIMIT 1;
             `;
-            const matchesResult = await client.query(matchQuery, [normalizedNewStandardizedName]);
+            const masterMatchResult = await client.query(matchMasterQuery, [normalizedNewStandardName, similarityThreshold]);
 
-            if (matchesResult.rows.length > 0 && matchesResult.rows[0].sim >= similarityThreshold) {
-                masterProductIdToSet = matchesResult.rows[0].id;
-                linkingStatusToSet = 'automatically_linked';
+            if (masterMatchResult.rows.length > 0) {
+                masterProductIdToSet = masterMatchResult.rows[0].id;
+                linkingStatusToSet = 'automatically_linked'; // Or 'relinked_by_supplier_edit'
             } else {
-                masterProductIdToSet = null; // If no good match, unlink or set to needs review
-                linkingStatusToSet = 'needs_admin_review';
+                // If no match, create a new master product
+                console.log(`[PRODUCT_GROUPING_UPDATE] No strong master match for new name "${normalizedNewStandardName}". Creating new master.`);
+                const createMasterQuery = `
+                    INSERT INTO master_products (standardized_name_normalized, display_name, description, image_url, brand, category, base_platform_price) 
+                    VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id;
+                `;
+                const masterValues = [normalizedNewStandardName, name.trim(), description || null, image_url || null, null, category.trim(), parseFloat(price)];
+                const newMasterResult = await client.query(createMasterQuery, masterValues);
+                masterProductIdToSet = newMasterResult.rows[0].id;
+                linkingStatusToSet = 'auto_master_created'; // From edit
             }
+        } else if (!normalizedNewStandardName) { // Supplier cleared the standardized name
+             masterProductIdToSet = null;
+             linkingStatusToSet = 'needs_admin_review';
         }
 
-        // 3. Update product
-        // The DB trigger handles products.updated_at
-        const updateQuery = `
+
+        // 3. Update the supplier's product
+        const updateProductQuery = `
             UPDATE products SET 
-                name = $1, 
-                standardized_name_input = $2,
-                description = $3, 
-                price = $4, 
-                discount_price = $5, 
-                category = $6, 
-                image_url = $7, 
-                is_on_sale = $8, 
-                stock_level = $9
-                ${masterProductIdToSet !== null || linkingStatusToSet !== null ? ', master_product_id = $11, linking_status = $12' : ''} 
-                -- Only update master_product_id and linking_status if they were re-evaluated
-            WHERE id = $10 AND supplier_id = $13 -- $10 is productId, $13 is supplierId
+                name = $1, standardized_name_input = $2, description = $3, price = $4, 
+                discount_price = $5, category = $6, image_url = $7, is_on_sale = $8, 
+                stock_level = $9, master_product_id = $10, linking_status = $11 
+                -- updated_at will be handled by trigger
+            WHERE id = $12 AND supplier_id = $13
             RETURNING *; 
         `;
-
-        const values = [
-            name.trim(),
-            standardized_name_input, // Store new raw input
-            description || null,
-            parseFloat(price),
-            discount_price ? parseFloat(discount_price) : null,
-            category.trim(),
-            image_url || null,
+        const productValues = [
+            name.trim(), standardized_name_input, description || null, parseFloat(price),
+            discount_price ? parseFloat(discount_price) : null, category.trim(), image_url || null,
             is_on_sale === undefined ? false : Boolean(is_on_sale),
             stock_level ? parseInt(stock_level, 10) : 0,
-            parsedProductId, // $10
+            masterProductIdToSet, linkingStatusToSet,
+            parsedProductId, supplierId
         ];
 
-        if (masterProductIdToSet !== null || linkingStatusToSet !== null) {
-            values.push(masterProductIdToSet); // $11
-            values.push(linkingStatusToSet);   // $12
-        }
-        values.push(supplierId); // $13 (or $11 if master_product_id wasn't updated)
-                                 // Adjust parameter numbers if query changes
-
-        // Adjust parameter numbers in the query string if master_product_id and linking_status are not being updated
-        let finalUpdateQuery = updateQuery;
-        if (masterProductIdToSet === null && linkingStatusToSet === null) {
-            // Remove the master_product_id and linking_status part from the query
-            // And adjust parameter numbers for WHERE clause
-             finalUpdateQuery = `
-                UPDATE products SET 
-                    name = $1, standardized_name_input = $2, description = $3, price = $4, 
-                    discount_price = $5, category = $6, image_url = $7, is_on_sale = $8, 
-                    stock_level = $9
-                WHERE id = $10 AND supplier_id = $11 
-                RETURNING *;`;
-            // Remove last two items from values if they were for master_product_id and linking_status
-            if (values.length > 11 && values[10] === masterProductIdToSet && values[11] === linkingStatusToSet) {
-                 values.splice(10, 2); // Remove 2 elements starting at index 10
-            }
-        }
-
-
-        const result = await client.query(finalUpdateQuery, values);
+        const updatedProductResult = await client.query(updateProductQuery, productValues);
         await client.query('COMMIT');
-
-        if (result.rows.length === 0) {
-             console.error(`[SUPPLIER_PRODUCT_UPDATE] Update failed for product ID ${parsedProductId} during final update.`);
-            return res.status(404).json({ error: 'Product not found or update failed unexpectedly.' });
-        }
         
-        console.log(`[SUPPLIER_PRODUCT_UPDATE] Product ID ${parsedProductId} updated by supplier ${supplierId}. New master_id: ${masterProductIdToSet}, status: ${linkingStatusToSet}`);
-        res.status(200).json(result.rows[0]);
+        console.log(`[SUPPLIER_PRODUCT_UPDATE] Product ${parsedProductId} updated by supplier ${supplierId}. Linked to master: ${masterProductIdToSet}, Status: ${linkingStatusToSet}`);
+        res.status(200).json(updatedProductResult.rows[0]);
 
     } catch (err) {
-        await client.query('ROLLBACK');
+        if (client) await client.query('ROLLBACK');
         console.error(`[SUPPLIER_PRODUCT_UPDATE] Error updating product ${parsedProductId} for supplier ${supplierId}:`, err);
+        // Handle specific errors like unique constraint on master_products if necessary
+        if (err.constraint === 'master_products_standardized_name_normalized_key' && err.code === '23505') {
+             console.error("[PRODUCT_GROUPING_UPDATE] Unique constraint violation on master_products.standardized_name_normalized during update.");
+             return res.status(409).json({ error: 'A master product with this standardized name already exists. Admin review may be needed.' });
+        }
         res.status(500).json({ error: 'Failed to update product.' });
     } finally {
-        client.release();
+        if (client) client.release();
     }
 });
 
