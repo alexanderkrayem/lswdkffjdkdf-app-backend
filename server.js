@@ -982,60 +982,114 @@ app.post('/api/auth/supplier/login', async (req, res) => {
 // ... (authSupplier middleware, GET /api/supplier/products route) ...
 
 // POST - Create a new product for the authenticated supplier
+// telegram-app-backend/server.js
+
 app.post('/api/supplier/products', authSupplier, async (req, res) => {
-    const supplierId = req.supplier.supplierId; // From authenticated JWT
+    const supplierId = req.supplier.supplierId;
     const { 
-        name, 
+        name,           // User-friendly display name
+        standardized_name_input, // What supplier enters as the "official" name
         description, 
         price, 
-        discount_price, // Optional
+        discount_price,
         category, 
-        image_url,      // Optional
-        is_on_sale,     // Optional, boolean
-        stock_level     // Optional, integer
+        image_url,
+        is_on_sale,
+        stock_level 
     } = req.body;
 
-    // Basic Validation
-    if (!name || !price || !category) { // Add more required fields as necessary
-        return res.status(400).json({ error: 'Name, price, and category are required.' });
+    // --- Validation ---
+    if (!name || name.trim() === '') {
+        return res.status(400).json({ error: 'Display name is required.' });
     }
-    if (isNaN(parseFloat(price)) || parseFloat(price) < 0) {
-         return res.status(400).json({ error: 'Invalid price format.' });
+    if (!standardized_name_input || standardized_name_input.trim() === '') { // New required field
+        return res.status(400).json({ error: 'Standardized product name (from packaging) is required.' });
     }
-    if (discount_price && (isNaN(parseFloat(discount_price)) || parseFloat(discount_price) < 0)) {
-        return res.status(400).json({ error: 'Invalid discount price format.' });
+    if (!price || isNaN(parseFloat(price)) || parseFloat(price) < 0) {
+         return res.status(400).json({ error: 'Valid price is required.' });
     }
-    if (stock_level && (isNaN(parseInt(stock_level)) || parseInt(stock_level) < 0)) {
-        return res.status(400).json({ error: 'Invalid stock level format.' });
+    if (!category || category.trim() === '') {
+        return res.status(400).json({ error: 'Category is required.' });
     }
+    // Add other validations for discount_price, stock_level if needed...
 
 
+    const client = await db.pool.connect(); // Use client for transaction
     try {
-        const query = `
-            INSERT INTO products 
-                (supplier_id, name, description, price, discount_price, category, image_url, is_on_sale, stock_level, created_at)
-            VALUES 
-                ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-            RETURNING *; -- Return the newly created product
+        await client.query('BEGIN');
+
+        const normalizedSupplierInputName = normalizeTextForMatching(standardized_name_input);
+        let masterProductId = null;
+        let linkingStatus = 'pending'; // Default status
+        const similarityThreshold = 0.7; // Tune this threshold (0.0 to 1.0)
+
+        if (normalizedSupplierInputName) {
+            // Attempt to find a matching master product using trigram similarity on normalized names
+            // The master_products.standardized_name_normalized column should be indexed with GIN trigram ops
+            const matchQuery = `
+                SELECT id, similarity(standardized_name_normalized, $1) AS sim
+                FROM master_products
+                ORDER BY sim DESC
+                LIMIT 1; 
+            `;
+            // We use PostgreSQL's normalize_text for the column value, 
+            // and JS normalizeTextForMatching for the input value.
+            // For best results, ensure the normalization is as close as possible.
+            // Or, pass the raw supplier input and let PG normalize it in the query:
+            // WHERE similarity(normalize_text(standardized_name_normalized), normalize_text($1)) > threshold
+            // However, indexing normalize_text(standardized_name_normalized) is complex.
+            // So, we rely on standardized_name_normalized already being normalized in DB.
+
+            const matchesResult = await client.query(matchQuery, [normalizedSupplierInputName]);
+
+            if (matchesResult.rows.length > 0 && matchesResult.rows[0].sim >= similarityThreshold) {
+                masterProductId = matchesResult.rows[0].id;
+                linkingStatus = 'automatically_linked';
+                console.log(`[SUPPLIER_PRODUCT_ADD] Product auto-linked to master_product_id ${masterProductId} with similarity ${matchesResult.rows[0].sim}`);
+            } else {
+                linkingStatus = 'needs_admin_review';
+                console.log(`[SUPPLIER_PRODUCT_ADD] No strong match found for master product. Status set to 'needs_admin_review'. Top similarity: ${matchesResult.rows.length > 0 ? matchesResult.rows[0].sim : 'N/A'}`);
+            }
+        } else {
+            linkingStatus = 'needs_admin_review'; // If no standardized name provided, needs review
+        }
+
+        const insertQuery = `
+            INSERT INTO products (
+                supplier_id, name, standardized_name_input, description, price, 
+                discount_price, category, image_url, is_on_sale, stock_level,
+                master_product_id, linking_status, created_at, updated_at 
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW()
+            ) RETURNING *;
         `;
         const values = [
             supplierId,
-            name,
-            description || null, // Default to null if not provided
+            name.trim(),
+            standardized_name_input, // Store the raw input from supplier
+            description || null,
             parseFloat(price),
             discount_price ? parseFloat(discount_price) : null,
-            category,
+            category.trim(),
             image_url || null,
-            is_on_sale || false, // Default to false
-            stock_level ? parseInt(stock_level) : 0 // Default to 0
+            is_on_sale === undefined ? false : Boolean(is_on_sale),
+            stock_level ? parseInt(stock_level, 10) : 0,
+            masterProductId, // Can be null
+            linkingStatus
         ];
 
-        const result = await db.query(query, values);
-        res.status(201).json(result.rows[0]); // Send back the created product
+        const result = await client.query(insertQuery, values);
+        await client.query('COMMIT');
+        
+        console.log(`[SUPPLIER_PRODUCT_ADD] Product created by supplier ${supplierId}: ID ${result.rows[0].id}, Linking Status: ${linkingStatus}`);
+        res.status(201).json(result.rows[0]);
+
     } catch (err) {
-        console.error(`Error creating product for supplier ${supplierId}:`, err);
-        // Check for specific DB errors if needed (e.g., foreign key violation if category was a FK)
+        await client.query('ROLLBACK');
+        console.error(`[SUPPLIER_PRODUCT_ADD] Error creating product for supplier ${supplierId}:`, err);
         res.status(500).json({ error: 'Failed to create product.' });
+    } finally {
+        client.release();
     }
 });
 // server.js
@@ -1047,112 +1101,149 @@ app.post('/api/supplier/products', authSupplier, async (req, res) => {
 // Ensure db object is available: const db = require('./config/db');
 
 // PUT - Update an existing product for the authenticated supplier
+// telegram-app-backend/server.js
+
 app.put('/api/supplier/products/:productId', authSupplier, async (req, res) => {
-    const supplierId = req.supplier.supplierId; // From JWT middleware
+    const supplierId = req.supplier.supplierId;
     const { productId } = req.params;
     const {
         name,
+        standardized_name_input, // Potentially updated by supplier
         description,
         price,
-        discount_price, // Can be null or a value
+        discount_price,
         category,
-        image_url,      // Can be null or a value
-        is_on_sale,     // Should be boolean
-        stock_level     // Should be integer
+        image_url,
+        is_on_sale,
+        stock_level
     } = req.body;
 
-    // --- Input Validation ---
     const parsedProductId = parseInt(productId, 10);
-    if (isNaN(parsedProductId)) {
-        return res.status(400).json({ error: 'Invalid Product ID format.' });
-    }
+    // --- Basic Validation (ensure all necessary fields are present if being updated) ---
+    if (isNaN(parsedProductId)) return res.status(400).json({ error: 'Invalid Product ID.' });
+    if (!name || name.trim() === '') return res.status(400).json({ error: 'Display name required.'});
+    if (!standardized_name_input || standardized_name_input.trim() === '') return res.status(400).json({ error: 'Standardized name required.'});
+    // Add other validations as per POST...
 
-    if (!name || typeof name !== 'string' || name.trim() === '') {
-        return res.status(400).json({ error: 'Product name is required and cannot be empty.' });
-    }
-    if (price === undefined || isNaN(parseFloat(price)) || parseFloat(price) < 0) {
-        return res.status(400).json({ error: 'Valid product price is required.' });
-    }
-    if (!category || typeof category !== 'string' || category.trim() === '') {
-        return res.status(400).json({ error: 'Product category is required.' });
-    }
-    if (discount_price !== undefined && discount_price !== null && (isNaN(parseFloat(discount_price)) || parseFloat(discount_price) < 0)) {
-        return res.status(400).json({ error: 'Discount price must be a valid number if provided.' });
-    }
-    if (stock_level !== undefined && stock_level !== null && (isNaN(parseInt(stock_level, 10)) || parseInt(stock_level, 10) < 0)) {
-        return res.status(400).json({ error: 'Stock level must be a valid non-negative integer if provided.' });
-    }
-    // is_on_sale will be coerced to boolean later
-
+    const client = await db.pool.connect();
     try {
-        // 1. Verify the product exists and belongs to the authenticated supplier
-        const checkOwnerQuery = 'SELECT supplier_id FROM products WHERE id = $1';
-        const ownerResult = await db.query(checkOwnerQuery, [parsedProductId]);
+        await client.query('BEGIN');
 
+        // 1. Verify ownership
+        const ownerResult = await client.query('SELECT supplier_id, standardized_name_input AS old_standardized_name FROM products WHERE id = $1', [parsedProductId]);
         if (ownerResult.rows.length === 0) {
+            await client.query('ROLLBACK'); client.release();
             return res.status(404).json({ error: 'Product not found.' });
         }
-        // Ensure supplierId from token (number) matches supplier_id from DB (likely number)
-        if (ownerResult.rows[0].supplier_id !== supplierId) { 
+        if (ownerResult.rows[0].supplier_id !== supplierId) {
+            await client.query('ROLLBACK'); client.release();
             return res.status(403).json({ error: 'Forbidden: You do not own this product.' });
         }
+        const oldStandardizedName = ownerResult.rows[0].old_standardized_name;
 
-        // 2. If ownership is confirmed, proceed with update
-        // The database trigger will handle 'updated_at = NOW()' automatically.
+        // 2. Handle master product linking if standardized_name_input has changed
+        let masterProductIdToSet = null; // Keep existing link by default if name doesn't change
+        let linkingStatusToSet = null;   // Keep existing status by default
+
+        const normalizedNewStandardizedName = normalizeTextForMatching(standardized_name_input);
+        const normalizedOldStandardizedName = normalizeTextForMatching(oldStandardizedName);
+
+        // Only re-evaluate master product link if the standardized name input has actually changed
+        if (normalizedNewStandardizedName && normalizedNewStandardizedName !== normalizedOldStandardizedName) {
+            console.log(`[SUPPLIER_PRODUCT_UPDATE] Standardized name changed for product ${parsedProductId}. Re-evaluating master link.`);
+            const similarityThreshold = 0.7;
+            const matchQuery = `
+                SELECT id, similarity(standardized_name_normalized, $1) AS sim
+                FROM master_products
+                ORDER BY sim DESC
+                LIMIT 1;
+            `;
+            const matchesResult = await client.query(matchQuery, [normalizedNewStandardizedName]);
+
+            if (matchesResult.rows.length > 0 && matchesResult.rows[0].sim >= similarityThreshold) {
+                masterProductIdToSet = matchesResult.rows[0].id;
+                linkingStatusToSet = 'automatically_linked';
+            } else {
+                masterProductIdToSet = null; // If no good match, unlink or set to needs review
+                linkingStatusToSet = 'needs_admin_review';
+            }
+        }
+
+        // 3. Update product
+        // The DB trigger handles products.updated_at
         const updateQuery = `
-            UPDATE products 
-            SET 
+            UPDATE products SET 
                 name = $1, 
-                description = $2, 
-                price = $3, 
-                discount_price = $4, 
-                category = $5, 
-                image_url = $6, 
-                is_on_sale = $7, 
-                stock_level = $8
-            WHERE id = $9 AND supplier_id = $10 -- Double check supplier_id for extra safety
+                standardized_name_input = $2,
+                description = $3, 
+                price = $4, 
+                discount_price = $5, 
+                category = $6, 
+                image_url = $7, 
+                is_on_sale = $8, 
+                stock_level = $9
+                ${masterProductIdToSet !== null || linkingStatusToSet !== null ? ', master_product_id = $11, linking_status = $12' : ''} 
+                -- Only update master_product_id and linking_status if they were re-evaluated
+            WHERE id = $10 AND supplier_id = $13 -- $10 is productId, $13 is supplierId
             RETURNING *; 
         `;
 
-        const finalPrice = parseFloat(price);
-        const finalDiscountPrice = (discount_price !== undefined && discount_price !== null && !isNaN(parseFloat(discount_price))) ? parseFloat(discount_price) : null;
-        const finalIsOnSale = (is_on_sale === true || is_on_sale === 'true'); // Coerce to boolean
-        const finalStockLevel = (stock_level !== undefined && stock_level !== null && !isNaN(parseInt(stock_level,10))) ? parseInt(stock_level, 10) : 0;
-
-
         const values = [
             name.trim(),
-            description || null, // Use null if description is empty or not provided
-            finalPrice,
-            finalDiscountPrice,
+            standardized_name_input, // Store new raw input
+            description || null,
+            parseFloat(price),
+            discount_price ? parseFloat(discount_price) : null,
             category.trim(),
-            image_url || null,   // Use null if image_url is empty or not provided
-            finalIsOnSale,
-            finalStockLevel,
-            parsedProductId,    // for WHERE id = $9
-            supplierId          // for WHERE supplier_id = $10
+            image_url || null,
+            is_on_sale === undefined ? false : Boolean(is_on_sale),
+            stock_level ? parseInt(stock_level, 10) : 0,
+            parsedProductId, // $10
         ];
 
-        console.log(`[SUPPLIER_PRODUCT_UPDATE] Updating product ID ${parsedProductId} for supplier ID ${supplierId} with values:`, {
-            name: values[0], category: values[4], price: values[2], stock: values[7] // Log some key values
-        });
+        if (masterProductIdToSet !== null || linkingStatusToSet !== null) {
+            values.push(masterProductIdToSet); // $11
+            values.push(linkingStatusToSet);   // $12
+        }
+        values.push(supplierId); // $13 (or $11 if master_product_id wasn't updated)
+                                 // Adjust parameter numbers if query changes
 
-        const result = await db.query(updateQuery, values);
-
-        if (result.rows.length === 0) {
-            // This case should ideally not be reached if the owner check passed and ID is correct,
-            // but it's a safeguard.
-            console.error(`[SUPPLIER_PRODUCT_UPDATE] Update failed for product ID ${parsedProductId} despite ownership check.`);
-            return res.status(404).json({ error: 'Product not found during update or update failed unexpectedly.' });
+        // Adjust parameter numbers in the query string if master_product_id and linking_status are not being updated
+        let finalUpdateQuery = updateQuery;
+        if (masterProductIdToSet === null && linkingStatusToSet === null) {
+            // Remove the master_product_id and linking_status part from the query
+            // And adjust parameter numbers for WHERE clause
+             finalUpdateQuery = `
+                UPDATE products SET 
+                    name = $1, standardized_name_input = $2, description = $3, price = $4, 
+                    discount_price = $5, category = $6, image_url = $7, is_on_sale = $8, 
+                    stock_level = $9
+                WHERE id = $10 AND supplier_id = $11 
+                RETURNING *;`;
+            // Remove last two items from values if they were for master_product_id and linking_status
+            if (values.length > 11 && values[10] === masterProductIdToSet && values[11] === linkingStatusToSet) {
+                 values.splice(10, 2); // Remove 2 elements starting at index 10
+            }
         }
 
-        console.log(`[SUPPLIER_PRODUCT_UPDATE] Product ID ${parsedProductId} updated successfully.`);
-        res.status(200).json(result.rows[0]); // Send back the updated product
+
+        const result = await client.query(finalUpdateQuery, values);
+        await client.query('COMMIT');
+
+        if (result.rows.length === 0) {
+             console.error(`[SUPPLIER_PRODUCT_UPDATE] Update failed for product ID ${parsedProductId} during final update.`);
+            return res.status(404).json({ error: 'Product not found or update failed unexpectedly.' });
+        }
+        
+        console.log(`[SUPPLIER_PRODUCT_UPDATE] Product ID ${parsedProductId} updated by supplier ${supplierId}. New master_id: ${masterProductIdToSet}, status: ${linkingStatusToSet}`);
+        res.status(200).json(result.rows[0]);
 
     } catch (err) {
+        await client.query('ROLLBACK');
         console.error(`[SUPPLIER_PRODUCT_UPDATE] Error updating product ${parsedProductId} for supplier ${supplierId}:`, err);
-        // Check for specific database errors if needed, e.g., constraint violations
-        res.status(500).json({ error: 'Failed to update product due to a server error.' });
+        res.status(500).json({ error: 'Failed to update product.' });
+    } finally {
+        client.release();
     }
 });
 
