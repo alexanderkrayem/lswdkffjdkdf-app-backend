@@ -1,5 +1,7 @@
 // server.js
 require('dotenv').config(); // Load environment variables from .env file
+const cron = require('node-cron');
+const pricingEngine = require('./services/pricingEngine'); // Adjust path if you placed it elsewhere
 const db = require('./config/db'); // Import the db config
 const express = require('express');
 const cors = require('cors');
@@ -1014,6 +1016,10 @@ app.post('/api/auth/supplier/login', async (req, res) => {
 // telegram-app-backend/server.js
 // Ensure normalizeTextForMatching function is defined at the top of your file
 
+// telegram-app-backend/server.js
+// Ensure normalizeTextForMatching function is defined at the top of your file
+// Ensure authSupplier middleware is imported
+
 app.post('/api/supplier/products', authSupplier, async (req, res) => {
     const supplierId = req.supplier.supplierId;
     const { 
@@ -1028,10 +1034,11 @@ app.post('/api/supplier/products', authSupplier, async (req, res) => {
         stock_level 
     } = req.body;
 
-    // --- Validation --- (Keep your existing validations)
+    // --- Validation ---
     if (!name || name.trim() === '') return res.status(400).json({ error: 'Display name is required.' });
     if (!standardized_name_input || standardized_name_input.trim() === '') return res.status(400).json({ error: 'Standardized product name is required.' });
-    if (!price || isNaN(parseFloat(price)) || parseFloat(price) < 0) return res.status(400).json({ error: 'Valid price is required.' });
+    const parsedPrice = parseFloat(price); // Parse once for validation and use
+    if (isNaN(parsedPrice) || parsedPrice < 0) return res.status(400).json({ error: 'Valid price is required.' });
     if (!category || category.trim() === '') return res.status(400).json({ error: 'Category is required.' });
     // ... other validations ...
 
@@ -1042,9 +1049,8 @@ app.post('/api/supplier/products', authSupplier, async (req, res) => {
         const normalizedSupplierStandardName = normalizeTextForMatching(standardized_name_input);
         let masterProductIdToLink;
         let linkingStatus;
-        const similarityThreshold = 0.7; // Tune this!
+        const similarityThreshold = 0.7; 
 
-        // 1. Attempt to find an existing master product
         if (normalizedSupplierStandardName) {
             const matchMasterQuery = `
                 SELECT id, similarity(standardized_name_normalized, $1) AS sim
@@ -1062,45 +1068,41 @@ app.post('/api/supplier/products', authSupplier, async (req, res) => {
             }
         }
 
-        // 2. If no strong match found, create a new master_product
         if (!masterProductIdToLink && normalizedSupplierStandardName) {
             console.log(`[PRODUCT_GROUPING] No strong master match for "${standardized_name_input}". Creating new master product.`);
+            // --- MODIFIED: Insert into master_products with initial_seed_price ---
+            // current_price_adjustment_percentage will use its DB DEFAULT (0.0000)
             const createMasterQuery = `
                 INSERT INTO master_products (
                     standardized_name_normalized, 
                     display_name, 
                     description, 
                     image_url, 
-                    brand,  -- Assuming category might contain brand info or you have separate field
+                    brand,
                     category,
-                    base_platform_price -- Set initial platform price, perhaps from supplier's price
+                    initial_seed_price -- <<< Ensure this column exists in master_products
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING id;
             `;
-            // Use supplier's input for initial master product details
-            // Consider if 'brand' should be extracted or a separate field
             const masterValues = [
                 normalizedSupplierStandardName,
-                name.trim(), // Use supplier's display name as initial display_name
+                name.trim(),
                 description || null,
                 image_url || null,
-                null, // Placeholder for brand, extract if possible
+                null, // Placeholder for brand
                 category.trim(),
-                parseFloat(price) // Initial base price from this first supplier's listing
+                parsedPrice // Use the validated and parsed price for initial_seed_price
             ];
             const newMasterResult = await client.query(createMasterQuery, masterValues);
             masterProductIdToLink = newMasterResult.rows[0].id;
-            linkingStatus = 'auto_master_created'; // New status
-            console.log(`[PRODUCT_GROUPING] New master_product_id created: ${masterProductIdToLink}`);
+            linkingStatus = 'auto_master_created';
+            console.log(`[PRODUCT_GROUPING] New master_product_id created: ${masterProductIdToLink}, initial_seed_price set to ${parsedPrice}`);
         } else if (!normalizedSupplierStandardName) {
-            // If supplier didn't provide a standardized name, it needs admin review to be grouped
             linkingStatus = 'needs_admin_review';
-            masterProductIdToLink = null; // Cannot link without a standardized name
+            masterProductIdToLink = null;
             console.log(`[PRODUCT_GROUPING] No standardized_name_input provided. Status: 'needs_admin_review'`);
         }
 
-
-        // 3. Insert the supplier's product, linking to the master_product_id
         const insertProductQuery = `
             INSERT INTO products (
                 supplier_id, name, standardized_name_input, description, price, 
@@ -1111,11 +1113,12 @@ app.post('/api/supplier/products', authSupplier, async (req, res) => {
         `;
         const productValues = [
             supplierId, name.trim(), standardized_name_input, description || null,
-            parseFloat(price), discount_price ? parseFloat(discount_price) : null,
+            parsedPrice, // Use the already parsed price
+            discount_price ? parseFloat(discount_price) : null,
             category.trim(), image_url || null,
             is_on_sale === undefined ? false : Boolean(is_on_sale),
-            stock_level ? parseInt(stock_level, 10) : 0,
-            masterProductIdToLink, // This will be NULL if no standardized name was provided or if master creation failed (though latter would error)
+            stock_price ? parseInt(stock_level, 10) : 0, // Corrected from stock_price to stock_level
+            masterProductIdToLink,
             linkingStatus
         ];
 
@@ -1126,14 +1129,11 @@ app.post('/api/supplier/products', authSupplier, async (req, res) => {
         res.status(201).json(productResult.rows[0]);
 
     } catch (err) {
-        if (client) await client.query('ROLLBACK'); // Ensure rollback if client was connected
+        if (client) await client.query('ROLLBACK');
         console.error(`[SUPPLIER_PRODUCT_ADD] Error creating product for supplier ${supplierId}:`, err);
         if (err.constraint === 'master_products_standardized_name_normalized_key' && err.code === '23505') {
-            // This can happen in a race condition if two suppliers add the "same" new product simultaneously
-            // or if our initial check missed an identical normalized name.
-            // A more robust solution would re-query for the existing master_product_id based on the conflicting name.
              console.error("[PRODUCT_GROUPING] Unique constraint violation on master_products.standardized_name_normalized. This might indicate a race condition or a missed match.");
-             return res.status(409).json({ error: 'A master product with this standardized name already exists. The system may need a moment to link, or please try a slightly different standardized name if this is a distinct product.' });
+             return res.status(409).json({ error: 'A master product with this standardized name already exists. Admin review may be needed.' });
         }
         res.status(500).json({ error: 'Failed to create product.' });
     } finally {
@@ -2620,6 +2620,31 @@ app.delete('/api/admin/featured-items-definitions/:featureId', authAdmin, async 
     }
 });
 
+// --- Cron Job Scheduling ---
+// Example: Run every hour at the 0th minute.
+// For testing, you might use '*/1 * * * *' (every minute) - BE CAREFUL with frequent DB updates.
+// '0 */2 * * *' would be every 2 hours at minute 0.
+const CRON_SCHEDULE = '0 */6 * * *'; // Every 6 hours at minute 0
+
+if (cron.validate(CRON_SCHEDULE)) {
+    console.log(`[CRON_SCHEDULER] Scheduling price adjustment job with pattern: ${CRON_SCHEDULE}`);
+    cron.schedule(CRON_SCHEDULE, () => {
+        console.log(`[CRON_SCHEDULER] Triggering scheduled price adjustment task at ${new Date().toISOString()}`);
+        pricingEngine.calculateDemandAndAdjustPercentage();
+    });
+} else {
+    console.error(`[CRON_SCHEDULER] Invalid cron schedule pattern: ${CRON_SCHEDULE}. Job not scheduled.`);
+}
+
+// For immediate testing on startup (optional, remove for production)
+// setTimeout(() => {
+//    console.log("[STARTUP_TRIGGER] Manually triggering price adjustment engine for testing...");
+//    pricingEngine.calculateDemandAndAdjustPercentage();
+// }, 45000); // e.g., 45 seconds after server starts to ensure DB is ready
+
+
+// const PORT = process.env.PORT || 3001;
+// app.listen(PORT, () => { ... });
 // TODO LATER:
 // PUT /api/supplier/deals/:dealId (authSupplier) - for editing
 // DELETE /api/supplier/deals/:dealId (authSupplier) - for deleting
