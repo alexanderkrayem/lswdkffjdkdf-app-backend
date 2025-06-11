@@ -10,6 +10,33 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const authAdmin = require('./middleware/authAdmin'); // IMPORT THIS
 
+const normalizeTextForMatching = (inputText) => {
+    if (typeof inputText !== 'string' || !inputText) {
+        return ''; // Return empty string for invalid input to avoid errors
+    }
+    let normalized = inputText;
+    
+    // 1. Convert to lowercase
+    normalized = normalized.toLowerCase();
+    
+    // 2. Trim leading/trailing whitespace
+    normalized = normalized.trim();
+    
+    // 3. Replace multiple spaces with a single space
+    normalized = normalized.replace(/\s+/g, ' ');
+
+    // 4. Basic unaccenting (very limited - for full support, use a library or DB function)
+    // Example: (You'd need to expand this significantly for comprehensive unaccenting)
+    // normalized = normalized.normalize("NFD").replace(/[\u0300-\u036f]/g, ""); // More generic diacritic removal
+    // For Arabic, specific unaccenting rules apply which are complex in pure JS.
+    // PostgreSQL's unaccent() is generally more reliable if you can apply it in the query
+    // or have a pre-normalized column in master_products.
+
+    // For now, we rely on the master_products.standardized_name_normalized already being fully normalized in the DB
+    // and this JS function primarily handles case and spacing for the input term.
+    return normalized;
+};
+
 // --- Middleware ---
 // Enable CORS for all routes and origins (adjust for production later)
 app.use(cors());
