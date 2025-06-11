@@ -73,60 +73,105 @@ app.get('/api/categories', async (req, res) => {
 // server.js
 // ... (other require statements, middleware, existing routes) ...
 
+// telegram-app-backend/server.js
 app.get('/api/search', async (req, res) => {
+    // ... (your existing variable declarations for searchTerm, filters, pagination for products) ...
     const searchTerm = req.query.searchTerm || '';
     const MIN_SEARCH_LENGTH = 3;
     const DEFAULT_RESULTS_LIMIT = 10;
 
     const categoryFilter = req.query.category || '';
-    // ... other filters like supplierIdFilter, minPriceFilter, maxPriceFilter, sortBy ...
-    // ... pagination for products: productPage, productLimit, safeProductPage, safeProductLimit, productOffset ...
-    // (Keeping your existing filter and pagination variable declarations)
+    const supplierIdFilter = parseInt(req.query.supplierId, 10) || null;
+    const minPriceFilter = parseFloat(req.query.minPrice) || null;
+    const maxPriceFilter = parseFloat(req.query.maxPrice) || null;
+    const sortBy = req.query.sortBy || 'relevance';
+
     const productPage = parseInt(req.query.page, 10) || 1;
     const productLimit = parseInt(req.query.limit, 10) || DEFAULT_RESULTS_LIMIT;
     const safeProductPage = Math.max(1, productPage);
     const safeProductLimit = Math.max(1, productLimit);
     const productOffset = (safeProductPage - 1) * safeProductLimit;
 
-
-    if (searchTerm.trim().length < MIN_SEARCH_LENGTH && !categoryFilter /* && other filters are also empty */) {
-        // ... (your existing return for short search term) ...
+    if (searchTerm.trim().length < MIN_SEARCH_LENGTH && !categoryFilter && !supplierIdFilter && !minPriceFilter && !maxPriceFilter) {
         return res.json({ /* ... empty results ... */ });
     }
 
     const ftsQueryString = `websearch_to_tsquery('pg_catalog.arabic', $1)`;
-    const trigramThreshold = 0.1; // Your existing threshold
+    const trigramThreshold = 0.1;
+
 
     try {
         // --- Product Search ---
-        // Main change: JOIN suppliers s and add s.is_active = TRUE
         let productsQuery = `
             SELECT
-                p.id, p.name, p.category, p.price, p.discount_price, p.is_on_sale, p.image_url, p.supplier_id, s_prod.name as supplier_name
+                p.id, 
+                p.name, -- This will be supplier's name, we might override it later
+                p.description, -- Supplier's description
+                p.price AS supplier_base_price, 
+                p.discount_price AS supplier_discount_price,
+                p.is_on_sale AS supplier_is_on_sale,
+                p.category, 
+                p.image_url, -- Supplier's image, might override with master
+                p.supplier_id, 
+                s_prod.name as supplier_name,
+                p.master_product_id,
+                COALESCE(mp.current_price_adjustment_percentage, 0.0000) AS price_adjustment_percentage,
+                mp.display_name AS master_product_display_name,
+                mp.image_url AS master_product_image_url -- Fetch master image too
                 ${searchTerm.trim() ? `, ts_rank_cd(p.tsv, product_fts_query.query) AS rank` : ''}
             FROM products p
-            LEFT JOIN suppliers s_prod ON p.supplier_id = s_prod.id  -- Renamed alias to s_prod to avoid conflict
+            LEFT JOIN suppliers s_prod ON p.supplier_id = s_prod.id
+            LEFT JOIN master_products mp ON p.master_product_id = mp.id -- Join master_products
             ${searchTerm.trim() ? `, LATERAL ${ftsQueryString} AS product_fts_query(query)` : ''}
         `;
+        // Count query needs similar joins for WHERE clause consistency
         let productCountQuery = `
             SELECT COUNT(DISTINCT p.id) AS total_items 
             FROM products p 
-            LEFT JOIN suppliers s_prod ON p.supplier_id = s_prod.id -- Renamed alias
+            LEFT JOIN suppliers s_prod ON p.supplier_id = s_prod.id
+            LEFT JOIN master_products mp ON p.master_product_id = mp.id 
             ${searchTerm.trim() ? `, LATERAL ${ftsQueryString} AS product_fts_query(query)` : ''}
         `;
 
-        const productWhereClauses = ["s_prod.is_active = TRUE"]; // <<< ADDED: Filter by active supplier for products
+        const productWhereClauses = ["s_prod.is_active = TRUE"];
         const productQueryParams = [];
         let productParamCount = 0;
 
         if (searchTerm.trim()) {
             productQueryParams.push(searchTerm.trim());
-            productWhereClauses.push(`(p.tsv @@ product_fts_query.query OR similarity(p.name, $${productParamCount + 1}) > $${productParamCount + 2})`);
+            // The FTS search (p.tsv) already includes supplier name, category, etc. from product.
+            // For master product data search, you'd need to include mp.tsv in the OR if desired.
+            // For now, searching primarily on product's own tsv.
+            productWhereClauses.push(`(p.tsv @@ product_fts_query.query OR similarity(COALESCE(mp.display_name, p.name), $${productParamCount + 1}) > $${productParamCount + 2})`);
             productQueryParams.push(trigramThreshold);
             productParamCount = 2;
         }
-        // ... (your existing code for adding categoryFilter, supplierIdFilter, minPriceFilter, maxPriceFilter to productWhereClauses and productQueryParams) ...
-        // Ensure those filters use p.category, p.supplier_id etc.
+
+        if (categoryFilter) {
+            productWhereClauses.push(`COALESCE(mp.category, p.category) ILIKE $${++productParamCount}`); // Search master or product category
+            productQueryParams.push(`%${categoryFilter}%`);
+        }
+        if (supplierIdFilter) { // This filter is for p.supplier_id, not master_product's supplier
+            productWhereClauses.push(`p.supplier_id = $${++productParamCount}`);
+            productQueryParams.push(supplierIdFilter);
+        }
+        
+        // Price filters should use the effective price logic
+        const priceCaseStatement = `
+            (
+                (COALESCE(mp.current_price_adjustment_percentage, 0.0000) + 1) * 
+                (CASE WHEN p.is_on_sale AND p.discount_price IS NOT NULL THEN p.discount_price ELSE p.price END)
+            )
+        `;
+        if (minPriceFilter !== null) {
+            productWhereClauses.push(`${priceCaseStatement} >= $${++productParamCount}`);
+            productQueryParams.push(minPriceFilter);
+        }
+        if (maxPriceFilter !== null) {
+            productWhereClauses.push(`${priceCaseStatement} <= $${++productParamCount}`);
+            productQueryParams.push(maxPriceFilter);
+        }
+
 
         if (productWhereClauses.length > 0) {
             const whereString = ' WHERE ' + productWhereClauses.join(' AND ');
@@ -134,84 +179,89 @@ app.get('/api/search', async (req, res) => {
             productCountQuery += whereString;
         }
 
-        // ... (your existing productOrderBy logic) ...
-        let productOrderBy = ''; // Your existing sorting logic
-        if (searchTerm.trim()) { // Example, adapt your full logic
-            productOrderBy = ` ORDER BY CASE WHEN p.tsv @@ product_fts_query.query THEN 0 ELSE 1 END, ts_rank_cd(p.tsv, product_fts_query.query) DESC, similarity(p.name, $1) DESC, p.created_at DESC`;
-        } else {
+        // Product Sorting Logic - needs to consider effective price for price sorts
+        let productOrderBy = '';
+        if (sortBy === 'price_asc') {
+            productOrderBy = ` ORDER BY ${priceCaseStatement} ASC, p.created_at DESC`;
+        } else if (sortBy === 'price_desc') {
+            productOrderBy = ` ORDER BY ${priceCaseStatement} DESC, p.created_at DESC`;
+        } else if (sortBy === 'newest') {
             productOrderBy = ' ORDER BY p.created_at DESC';
+        } else { 
+            if (searchTerm.trim()) {
+                productOrderBy = ` ORDER BY CASE WHEN p.tsv @@ product_fts_query.query THEN 0 ELSE 1 END, ts_rank_cd(p.tsv, product_fts_query.query) DESC, similarity(COALESCE(mp.display_name, p.name), $1) DESC, p.created_at DESC`;
+            } else {
+                productOrderBy = ' ORDER BY p.created_at DESC';
+            }
         }
         productsQuery += productOrderBy;
-
 
         productsQuery += ` LIMIT $${++productParamCount} OFFSET $${++productParamCount}`;
         productQueryParams.push(safeProductLimit, productOffset);
         
         const productCountQueryParams = productQueryParams.slice(0, productQueryParams.length - 2);
 
-        console.log("Product Query (Search):", productsQuery, productQueryParams);
         const productsResult = await db.query(productsQuery, productQueryParams);
-        console.log("Product Count Query (Search):", productCountQuery, productCountQueryParams);
         const productCountResult = await db.query(productCountQuery, productCountQueryParams);
-        // ... (rest of your product pagination setup) ...
-        const totalProductItems = parseInt(productCountResult.rows[0].total_items, 10);
-        const totalProductPages = Math.ceil(totalProductItems / safeProductLimit);
+        
+        const processedProducts = productsResult.rows.map(p => {
+            let basePriceForCalc = parseFloat(p.supplier_base_price);
+            if (p.supplier_is_on_sale && p.supplier_discount_price !== null) {
+                basePriceForCalc = parseFloat(p.supplier_discount_price);
+            }
+            const adjustment = parseFloat(p.price_adjustment_percentage);
+            const effectivePrice = basePriceForCalc * (1 + adjustment);
+
+            return {
+                id: p.id,
+                name: p.master_product_id && p.master_product_display_name ? p.master_product_display_name : p.name,
+                // description: p.master_product_id && p.master_product_description ? p.master_product_description : p.description, // Decide if needed for search result card
+                category: p.master_product_id && mpFetch?.category ? mpFetch.category : p.category, // mpFetch would be needed if master category is different and desired
+                image_url: p.master_product_id && p.master_product_image_url ? p.master_product_image_url : p.image_url,
+                effective_selling_price: parseFloat(effectivePrice.toFixed(2)),
+                supplier_name: p.supplier_name, // From the join with suppliers s_prod
+                supplier_id: p.supplier_id,
+                // Add other fields needed for product card display
+                // Be careful not to send too much data for list views
+                is_on_sale: p.supplier_is_on_sale, // Or a new combined is_on_sale if effective price < supplier_base_price
+                original_price_if_adjusted: (adjustment !== 0 || (p.supplier_is_on_sale && p.supplier_discount_price !== null)) ? parseFloat(p.supplier_base_price).toFixed(2) : null,
+                rank: p.rank // from FTS
+            };
+        });
+
         const paginatedProducts = {
-            items: productsResult.rows,
+            items: processedProducts,
             currentPage: safeProductPage,
-            totalPages: totalProductPages,
-            totalItems: totalProductItems,
+            totalPages: Math.ceil(parseInt(productCountResult.rows[0].total_items, 10) / safeProductLimit),
+            totalItems: parseInt(productCountResult.rows[0].total_items, 10),
             limit: safeProductLimit
         };
 
-
-        // --- Deals Search ---
-        // Main change: If deals are linked to suppliers, join and check supplier's is_active status
+        // --- Deals Search (No price change here, but ensure s_deal.is_active filter) ---
+        // ... (your existing deals search query, ensure it has s_deal.is_active = TRUE check) ...
+        // ... (from previous message, it was already correct) ...
         let dealsResult = { rows: [] };
-        if (searchTerm.trim()) {
-            // Assuming d.supplier_id can be NULL for platform deals
-            const dealsQuery = `
-                SELECT d.id, d.title, d.description, d.image_url, ts_rank_cd(d.tsv, query) AS rank
-                FROM deals d
-                LEFT JOIN suppliers s_deal ON d.supplier_id = s_deal.id -- Join to check supplier status
-                , ${ftsQueryString} query
-                WHERE d.is_active = TRUE 
-                  AND (d.supplier_id IS NULL OR s_deal.is_active = TRUE) -- Deal is platform OR its supplier is active
-                  AND (d.tsv @@ query OR similarity(d.title, $1) > $2)
-                ORDER BY CASE WHEN d.tsv @@ query THEN 0 ELSE 1 END, ts_rank_cd(d.tsv, query) DESC, similarity(d.title, $1) DESC, d.created_at DESC
-                LIMIT $3;
-            `;
-            dealsResult = await db.query(dealsQuery, [searchTerm.trim(), trigramThreshold, DEFAULT_RESULTS_LIMIT]);
-        }
+        // ... (your existing deals fetching logic, assuming it correctly filters by active suppliers if applicable)
 
-        // --- Suppliers Search ---
-        // Main change: Add WHERE s.is_active = TRUE
+        // --- Suppliers Search (No price change here, ensure s.is_active filter) ---
+        // ... (your existing suppliers search query, ensure it has s.is_active = TRUE check) ...
+        // ... (from previous message, it was already correct) ...
         let suppliersResult = { rows: [] };
-        if (searchTerm.trim()) {
-            const suppliersQuery = `
-                SELECT s.id, s.name, s.category, s.location, s.rating, s.image_url, ts_rank_cd(s.tsv, query) AS rank
-                FROM suppliers s, ${ftsQueryString} query
-                WHERE s.is_active = TRUE -- <<< ADDED: Filter for active suppliers
-                  AND (s.tsv @@ query OR similarity(s.name, $1) > $2)
-                ORDER BY CASE WHEN s.tsv @@ query THEN 0 ELSE 1 END, ts_rank_cd(s.tsv, query) DESC, similarity(s.name, $1) DESC, s.id
-                LIMIT $3;
-            `;
-            suppliersResult = await db.query(suppliersQuery, [searchTerm.trim(), trigramThreshold, DEFAULT_RESULTS_LIMIT]);
-        }
+        // ... (your existing suppliers fetching logic, assuming it correctly filters by active)
+
 
         res.json({
             searchTerm: searchTerm,
-            // ... (your existing filters echo back) ...
+            filters: { /* ... */ },
             results: {
                 products: paginatedProducts,
-                deals: dealsResult.rows,
-                suppliers: suppliersResult.rows
+                deals: dealsResult.rows, // Ensure this data is fetched as before
+                suppliers: suppliersResult.rows // Ensure this data is fetched as before
             }
         });
 
     } catch (err) {
-        // ... (your existing error handling) ...
-        console.error(`Error during global search:`, err);
+        console.error(`Error during global search for term "${searchTerm}":`, err);
         res.status(500).json({ error: 'Failed to perform search' });
     }
 });
@@ -377,6 +427,8 @@ app.get('/api/suppliers/:supplierId', async (req, res) => {
 // ... (other routes, app.listen) ...ß
 // ... (rest of server.js) ...
 // GET all products (NOW WITH PAGINATION)
+// telegram-app-backend/server.js
+
 app.get('/api/products', async (req, res) => {
     const page = parseInt(req.query.page, 10) || 1;
     const limit = parseInt(req.query.limit, 10) || 20;
@@ -384,20 +436,34 @@ app.get('/api/products', async (req, res) => {
     const safeLimit = Math.max(1, limit);
     const offset = (safePage - 1) * safeLimit;
 
-    // --- LATER: For category filters etc., they would be added to WHERE clauses below ---
-    // const categoryFilter = req.query.category || ''; 
+    // const categoryFilter = req.query.category || ''; // For later filters
 
     try {
         let itemsQuery = `
-            SELECT p.* 
+            SELECT 
+                p.id,
+                p.name,
+                p.description,
+                p.price AS supplier_base_price, -- Renamed for clarity
+                p.discount_price AS supplier_discount_price,
+                p.category,
+                p.image_url,
+                p.is_on_sale AS supplier_is_on_sale,
+                p.stock_level,
+                p.created_at,
+                p.supplier_id,
+                s.name AS supplier_name,
+                p.master_product_id,
+                COALESCE(mp.current_price_adjustment_percentage, 0.0000) AS price_adjustment_percentage 
+                -- COALESCE ensures a value if master_product_id is NULL or no matching master_product
             FROM products p
             JOIN suppliers s ON p.supplier_id = s.id
+            LEFT JOIN master_products mp ON p.master_product_id = mp.id -- LEFT JOIN to include products not yet linked to a master
         `;
         const queryParams = [];
         let paramCount = 0;
-        let whereClauses = ["s.is_active = TRUE"]; // Start with active supplier filter
+        let whereClauses = ["s.is_active = TRUE"]; // Always filter by active supplier
 
-        // --- LATER: Add other filters here if needed ---
         // if (categoryFilter) {
         //     whereClauses.push(`p.category ILIKE $${++paramCount}`);
         //     queryParams.push(`%${categoryFilter}%`);
@@ -412,20 +478,35 @@ app.get('/api/products', async (req, res) => {
         queryParams.push(safeLimit, offset);
 
         const itemsResult = await db.query(itemsQuery, queryParams);
-        const products = itemsResult.rows;
+        
+        // Calculate effective_selling_price for each product
+        const productsWithEffectivePrice = itemsResult.rows.map(p => {
+            let basePriceForCalc = parseFloat(p.supplier_base_price);
+            if (p.supplier_is_on_sale && p.supplier_discount_price !== null) {
+                basePriceForCalc = parseFloat(p.supplier_discount_price);
+            }
+            const adjustment = parseFloat(p.price_adjustment_percentage);
+            const effectivePrice = basePriceForCalc * (1 + adjustment);
+            
+            return {
+                ...p, // Spread all original product fields
+                effective_selling_price: parseFloat(effectivePrice.toFixed(2))
+                // You might want to remove price_adjustment_percentage from the final client response
+                // delete p.price_adjustment_percentage; 
+            };
+        });
 
-        // --- Count Query ---
+        // --- Count Query (must reflect the same JOINs and WHERE clauses) ---
         let countQuery = `
             SELECT COUNT(DISTINCT p.id) AS total_items 
             FROM products p
             JOIN suppliers s ON p.supplier_id = s.id
+            -- No need to LEFT JOIN master_products for count if not filtering by it
         `;
-        const countQueryParams = []; // Parameters for the WHERE clause of count query
-        let countParamCountInternal = 0; // Separate counter for these params
+        const countQueryParams = [];
+        let countParamCountInternal = 0;
         let countWhereClauses = ["s.is_active = TRUE"];
 
-
-        // --- LATER: Add SAME other filters here ---
         // if (categoryFilter) {
         //     countWhereClauses.push(`p.category ILIKE $${++countParamCountInternal}`);
         //     countQueryParams.push(`%${categoryFilter}%`);
@@ -435,12 +516,12 @@ app.get('/api/products', async (req, res) => {
             countQuery += ' WHERE ' + countWhereClauses.join(' AND ');
         }
         
-        const countResult = await db.query(countQuery, countQueryParams); // Pass only filter params
+        const countResult = await db.query(countQuery, countQueryParams);
         const totalItems = parseInt(countResult.rows[0].total_items, 10);
         const totalPages = Math.ceil(totalItems / safeLimit);
 
         res.json({
-            items: products,
+            items: productsWithEffectivePrice, // Send products with the new effective price
             currentPage: safePage,
             totalPages: totalPages,
             totalItems: totalItems,
@@ -460,6 +541,8 @@ app.get('/api/products', async (req, res) => {
 // --- NEW: GET multiple products by a list of IDs ---
 // Expects a comma-separated string of product IDs in a query parameter
 // e.g., /api/products/batch?ids=1,2,3,4
+// telegram-app-backend/server.js
+
 // telegram-app-backend/server.js
 
 app.get('/api/products/batch', async (req, res) => {
@@ -483,27 +566,47 @@ app.get('/api/products/batch', async (req, res) => {
                 p.id, 
                 p.name, 
                 p.description, 
-                p.price, 
-                p.discount_price, 
+                p.price AS supplier_base_price, 
+                p.discount_price AS supplier_discount_price, 
                 p.category, 
                 p.image_url, 
-                p.is_on_sale, 
+                p.is_on_sale AS supplier_is_on_sale, 
                 p.stock_level, 
                 p.created_at,
                 p.supplier_id,
-                s.name AS supplier_name 
-                -- p.*, s.name AS supplier_name -- Simpler way to select all from p
+                s.name AS supplier_name,
+                p.master_product_id,
+                COALESCE(mp.current_price_adjustment_percentage, 0.0000) AS price_adjustment_percentage,
+                mp.display_name AS master_product_display_name,
+                mp.image_url AS master_product_image_url 
             FROM products p
             LEFT JOIN suppliers s ON p.supplier_id = s.id
+            LEFT JOIN master_products mp ON p.master_product_id = mp.id
             WHERE p.id = ANY($1::int[]) 
-              AND s.is_active = TRUE; -- <<< MODIFIED: Only products from active suppliers
+              AND s.is_active = TRUE; -- Only products from active suppliers
         `;
-        // $1::int[] tells PostgreSQL to treat the parameter as an array of integers.
-
         const result = await db.query(query, [productIds]);
+
+        const productsWithEffectivePrice = result.rows.map(p => {
+            let basePriceForCalc = parseFloat(p.supplier_base_price);
+            if (p.supplier_is_on_sale && p.supplier_discount_price !== null) {
+                basePriceForCalc = parseFloat(p.supplier_discount_price);
+            }
+            const adjustment = parseFloat(p.price_adjustment_percentage);
+            const effectivePrice = basePriceForCalc * (1 + adjustment);
+
+            return {
+                ...p,
+                name: p.master_product_id && p.master_product_display_name ? p.master_product_display_name : p.name,
+                image_url: p.master_product_id && p.master_product_image_url ? p.master_product_image_url : p.image_url,
+                effective_selling_price: parseFloat(effectivePrice.toFixed(2)),
+                // Optionally remove adjustment percentage from final response
+                // price_adjustment_percentage: undefined 
+            };
+        });
         
-        console.log(`[BATCH_PRODUCTS] Fetched ${result.rows.length} products for IDs: ${productIds.join(',')}, considering active suppliers.`);
-        res.json(result.rows);
+        console.log(`[BATCH_PRODUCTS] Fetched ${productsWithEffectivePrice.length} products for IDs: ${productIds.join(',')}`);
+        res.json(productsWithEffectivePrice);
 
     } catch (err) {
         console.error('[BATCH_PRODUCTS] Error fetching products by batch:', err);
@@ -514,11 +617,13 @@ app.get('/api/products/batch', async (req, res) => {
 // ... (rest of server.js, app.listen) ...
 // --- NEW: GET a single product by ID ---
 // e.g., /api/products/123
-app.get('/api/products/:productId', async (req, res) => {
-    const { productId } = req.params; // Get productId from URL parameters
+// telegram-app-backend/server.js
 
-    // Validate if productId is a number (basic validation)
-    if (isNaN(parseInt(productId, 10))) {
+app.get('/api/products/:productId', async (req, res) => {
+    const { productId } = req.params;
+    const parsedProductId = parseInt(productId, 10); // Parse once
+
+    if (isNaN(parsedProductId)) {
         return res.status(400).json({ error: 'Invalid Product ID format.' });
     }
 
@@ -528,28 +633,59 @@ app.get('/api/products/:productId', async (req, res) => {
                 p.id, 
                 p.name, 
                 p.description, 
-                p.price, 
-                p.discount_price, 
+                p.price AS supplier_base_price, 
+                p.discount_price AS supplier_discount_price, 
                 p.category, 
                 p.image_url, 
-                p.is_on_sale, 
+                p.is_on_sale AS supplier_is_on_sale, 
                 p.stock_level, 
                 p.created_at,
                 p.supplier_id, 
-                s.name AS supplier_name,  -- Include supplier's name
-                s.location AS supplier_location -- Optionally include supplier's location
-                -- Add any other product fields you need for the detail view
+                s.name AS supplier_name,
+                s.location AS supplier_location,
+                p.master_product_id,
+                COALESCE(mp.current_price_adjustment_percentage, 0.0000) AS price_adjustment_percentage,
+                mp.display_name AS master_product_display_name, -- Optional: get master display name
+                mp.description AS master_product_description -- Optional: get master description
             FROM products p
-            LEFT JOIN suppliers s ON p.supplier_id = s.id -- LEFT JOIN to still get product if supplier is missing (though unlikely with FKs)
-            WHERE p.id = $1;
+            LEFT JOIN suppliers s ON p.supplier_id = s.id
+            LEFT JOIN master_products mp ON p.master_product_id = mp.id
+            WHERE p.id = $1 AND s.is_active = TRUE; -- Ensure supplier is active
         `;
-        // Parameterized query to prevent SQL injection
-        const result = await db.query(query, [productId]);
+        const result = await db.query(query, [parsedProductId]);
 
         if (result.rows.length > 0) {
-            res.json(result.rows[0]); // Send the first (and should be only) product found
+            const product = result.rows[0];
+            
+            let basePriceForCalc = parseFloat(product.supplier_base_price);
+            if (product.supplier_is_on_sale && product.supplier_discount_price !== null) {
+                basePriceForCalc = parseFloat(product.supplier_discount_price);
+            }
+            const adjustment = parseFloat(product.price_adjustment_percentage);
+            const effectivePrice = basePriceForCalc * (1 + adjustment);
+
+            // Decide which name/description to show to the user: supplier's or master's?
+            // For now, let's prioritize master if available and product is linked, else supplier's.
+            const displayName = product.master_product_id && product.master_product_display_name 
+                                ? product.master_product_display_name 
+                                : product.name;
+            const displayDescription = product.master_product_id && product.master_product_description
+                                ? product.master_product_description
+                                : product.description;
+
+            const finalProductData = {
+                ...product, // Spread original fields (includes supplier_base_price etc.)
+                name: displayName, // Override name with display name
+                description: displayDescription, // Override description
+                effective_selling_price: parseFloat(effectivePrice.toFixed(2))
+            };
+            // delete finalProductData.price_adjustment_percentage;
+            // delete finalProductData.master_product_display_name;
+            // delete finalProductData.master_product_description;
+
+            res.json(finalProductData);
         } else {
-            res.status(404).json({ error: 'Product not found' }); // No product with that ID
+            res.status(404).json({ error: 'Product not found or its supplier is inactive.' });
         }
     } catch (err) {
         console.error(`Error fetching product with ID ${productId}:`, err);
@@ -645,106 +781,102 @@ app.post('/api/user/profile', async (req, res) => {
 
 // POST Create a new order from user's cart
 // Expects { userId } in request body
+// telegram-app-backend/server.js
+
 app.post('/api/orders', async (req, res) => {
-  const { userId } = req.body;
+    const { userId } = req.body;
 
-  if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
-  }
+    if (!userId) return res.status(400).json({ error: 'User ID is required' });
 
-  // Use a database client for transaction control
-  const client = await db.pool.connect(); // Get a client from the pool
+    const client = await db.pool.connect();
+    try {
+        await client.query('BEGIN');
+        console.log(`[ORDER_CREATE_V2] Transaction BEGIN for user ${userId}`);
 
-  try {
-      // --- Start Transaction ---
-      await client.query('BEGIN');
-      console.log(`Order Transaction BEGIN for user ${userId}`);
+        // 1. Fetch cart items, including master_product_id and adjustment percentage
+        const cartQuery = `
+            SELECT
+                ci.product_id,
+                ci.quantity,
+                p.price AS supplier_base_price,
+                p.discount_price AS supplier_discount_price,
+                p.is_on_sale AS supplier_is_on_sale,
+                p.master_product_id,
+                COALESCE(mp.current_price_adjustment_percentage, 0.0000) AS price_adjustment_percentage,
+                s.is_active AS supplier_is_active -- Get supplier active status
+            FROM cart_items ci
+            JOIN products p ON ci.product_id = p.id
+            JOIN suppliers s ON p.supplier_id = s.id -- Crucial JOIN for is_active check
+            LEFT JOIN master_products mp ON p.master_product_id = mp.id
+            WHERE ci.user_id = $1; 
+            -- FOR UPDATE OF p, mp; -- Consider row-level locking if high concurrency on price changes
+        `;
+        const cartResult = await client.query(cartQuery, [userId]);
+        
+        // Filter out items from inactive suppliers *before* processing
+        const validCartItems = cartResult.rows.filter(item => item.supplier_is_active);
 
-      // 1. Fetch cart items and product details for the user, lock rows for update
-      // Locking ensures price/stock doesn't change between reading cart and creating order
-      // (Optional but safer for high traffic - FOR UPDATE requires careful use)
-      // Simpler approach first: just fetch current cart.
-      const cartQuery = `
-          SELECT
-              ci.product_id,
-              ci.quantity,
-              p.price,
-              p.discount_price,
-              p.is_on_sale
-          FROM cart_items ci
-          JOIN products p ON ci.product_id = p.id
-          WHERE ci.user_id = $1;
-          -- FOR UPDATE; -- Optional: If you need to lock products during checkout
-      `;
-      const cartResult = await client.query(cartQuery, [userId]);
-      const cartItems = cartResult.rows;
+        if (validCartItems.length === 0) {
+            await client.query('ROLLBACK');
+            client.release();
+            console.log(`[ORDER_CREATE_V2] No valid items in cart (all from inactive suppliers or cart empty) for user ${userId}.`);
+            return res.status(400).json({ error: 'Cart is empty or contains only items from inactive suppliers.' });
+        }
 
-      if (cartItems.length === 0) {
-          await client.query('ROLLBACK'); // Rollback transaction
-          console.log(`Order Transaction ROLLBACK for user ${userId} - Cart empty`);
-          return res.status(400).json({ error: 'Cart is empty, cannot create order' });
-      }
+        // 2. Calculate total amount and prepare order items using effective selling price
+        let totalOrderAmount = 0;
+        const orderItemsData = validCartItems.map(item => {
+            let basePriceForCalc = parseFloat(item.supplier_base_price);
+            if (item.supplier_is_on_sale && item.supplier_discount_price !== null) {
+                basePriceForCalc = parseFloat(item.supplier_discount_price);
+            }
+            const adjustment = parseFloat(item.price_adjustment_percentage);
+            const priceAtTimeOfOrder = parseFloat((basePriceForCalc * (1 + adjustment)).toFixed(2));
+            
+            totalOrderAmount += priceAtTimeOfOrder * item.quantity;
+            return {
+                productId: item.product_id,
+                quantity: item.quantity,
+                price_at_time_of_order: priceAtTimeOfOrder // Store the final calculated price
+            };
+        });
+        console.log(`[ORDER_CREATE_V2] Order for user ${userId}: Total=${totalOrderAmount.toFixed(2)}, Items=${orderItemsData.length}`);
 
-      // 2. Calculate total amount and prepare order items
-      let totalAmount = 0;
-      const orderItemsData = cartItems.map(item => {
-          const priceAtOrderTime = item.is_on_sale && item.discount_price ? item.discount_price : item.price;
-          totalAmount += parseFloat(priceAtOrderTime) * item.quantity;
-          return {
-              productId: item.product_id,
-              quantity: item.quantity,
-              priceAtTimeOfOrder: priceAtOrderTime
-          };
-      });
-      console.log(`Order Calculation for user ${userId}: Total=${totalAmount}, Items=${orderItemsData.length}`);
+        // 3. Insert into orders table
+        const orderInsertQuery = `
+            INSERT INTO orders (user_id, total_amount, status) VALUES ($1, $2, 'pending') RETURNING id;
+        `;
+        const orderInsertResult = await client.query(orderInsertQuery, [userId, totalOrderAmount.toFixed(2)]);
+        const newOrderId = orderInsertResult.rows[0].id;
 
-      // 3. Insert into orders table
-      const orderInsertQuery = `
-          INSERT INTO orders (user_id, total_amount, status)
-          VALUES ($1, $2, $3)
-          RETURNING id; -- Get the new order ID
-      `;
-      const orderInsertResult = await client.query(orderInsertQuery, [userId, totalAmount, 'pending']); // Default status 'pending'
-      const newOrderId = orderInsertResult.rows[0].id;
-      console.log(`Order Created for user ${userId}: OrderID=${newOrderId}`);
+        // 4. Insert into order_items table
+        const orderItemsInsertQuery = `
+            INSERT INTO order_items (order_id, product_id, quantity, price_at_time_of_order, supplier_item_status)
+            VALUES ${orderItemsData.map((_, index) => 
+                `($${index * 5 + 1}, $${index * 5 + 2}, $${index * 5 + 3}, $${index * 5 + 4}, $${index * 5 + 5})`
+            ).join(', ')};
+        `;
+        const orderItemsValues = orderItemsData.reduce((acc, item) => {
+            acc.push(newOrderId, item.productId, item.quantity, item.priceAtTimeOfOrder, 'pending'); // Default item status
+            return acc;
+        }, []);
+        await client.query(orderItemsInsertQuery, orderItemsValues);
 
+        // 5. Delete items from cart_items table
+        const cartDeleteQuery = 'DELETE FROM cart_items WHERE user_id = $1';
+        await client.query(cartDeleteQuery, [userId]);
 
-      // 4. Insert into order_items table
-      // Construct a multi-row insert query for efficiency
-      const orderItemsInsertQuery = `
-          INSERT INTO order_items (order_id, product_id, quantity, price_at_time_of_order)
-          VALUES ${orderItemsData.map((_, index) => `($${index * 4 + 1}, $${index * 4 + 2}, $${index * 4 + 3}, $${index * 4 + 4})`).join(', ')}
-      `;
-      // Flatten the values array: [orderId, productId1, qty1, price1, orderId, productId2, qty2, price2, ...]
-      const orderItemsValues = orderItemsData.reduce((acc, item) => {
-          acc.push(newOrderId, item.productId, item.quantity, item.priceAtTimeOfOrder);
-          return acc;
-      }, []);
+        await client.query('COMMIT');
+        console.log(`[ORDER_CREATE_V2] Transaction COMMIT for user ${userId}, OrderID=${newOrderId}`);
+        res.status(201).json({ message: 'Order created successfully', orderId: newOrderId, totalAmount: totalOrderAmount.toFixed(2) });
 
-      await client.query(orderItemsInsertQuery, orderItemsValues);
-       console.log(`Order Items Inserted for user ${userId}, OrderID=${newOrderId}`);
-
-      // 5. Delete items from cart_items table
-      const cartDeleteQuery = 'DELETE FROM cart_items WHERE user_id = $1';
-      await client.query(cartDeleteQuery, [userId]);
-      console.log(`Cart Cleared for user ${userId}`);
-
-      // --- Commit Transaction ---
-      await client.query('COMMIT');
-      console.log(`Order Transaction COMMIT for user ${userId}, OrderID=${newOrderId}`);
-
-      res.status(201).json({ message: 'Order created successfully', orderId: newOrderId });
-
-  } catch (err) {
-      // --- Rollback Transaction on Error ---
-      await client.query('ROLLBACK');
-      console.error(`Order Transaction ROLLBACK for user ${userId} due to error:`, err);
-      res.status(500).json({ error: 'Failed to create order' });
-  } finally {
-      // --- Release Client Back to Pool ---
-      client.release();
-       console.log(`Database client released for user ${userId} order transaction.`);
-  }
+    } catch (err) {
+        if (client) await client.query('ROLLBACK');
+        console.error(`[ORDER_CREATE_V2] Transaction ROLLBACK for user ${userId} due to error:`, err);
+        res.status(500).json({ error: 'Failed to create order' });
+    } finally {
+        if (client) client.release();
+    }
 });
 
 // telegram-app-backend/server.js
@@ -839,38 +971,73 @@ app.get('/api/orders', async (req, res) => {
 
 // GET user's cart items
 // Expects user_id as a query parameter, e.g., /api/cart?userId=12345
+// telegram-app-backend/server.js
+
 app.get('/api/cart', async (req, res) => {
-  const userId = req.query.userId;
+    const userId = req.query.userId;
 
-  // Basic validation
-  if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
-  }
+    if (!userId) {
+        return res.status(400).json({ error: 'User ID is required' });
+    }
 
-  try {
-      // Join cart_items with products to get product details
-      const query = `
-          SELECT
-              ci.product_id,
-              ci.quantity,
-              p.name,
-              p.price,
-              p.discount_price,
-              p.image_url,
-              p.is_on_sale
-          FROM cart_items ci
-          JOIN products p ON ci.product_id = p.id
-          WHERE ci.user_id = $1
-          ORDER BY ci.added_at DESC;
-      `;
-      const result = await db.query(query, [userId]);
-      res.json(result.rows); // Send array of cart items with product details
+    try {
+        const query = `
+            SELECT
+                ci.product_id,
+                ci.quantity,
+                p.name AS product_original_name, -- Supplier's name for the product
+                p.price AS supplier_base_price,
+                p.discount_price AS supplier_discount_price,
+                p.image_url AS product_original_image_url, -- Supplier's image
+                p.is_on_sale AS supplier_is_on_sale,
+                p.supplier_id,
+                s.is_active AS supplier_is_active,
+                p.master_product_id,
+                COALESCE(mp.current_price_adjustment_percentage, 0.0000) AS price_adjustment_percentage,
+                mp.display_name AS master_product_display_name,
+                mp.image_url AS master_product_image_url
+            FROM cart_items ci
+            JOIN products p ON ci.product_id = p.id
+            JOIN suppliers s ON p.supplier_id = s.id -- Ensure supplier is joined
+            LEFT JOIN master_products mp ON p.master_product_id = mp.id
+            WHERE ci.user_id = $1 
+              AND s.is_active = TRUE -- Only include items from active suppliers in cart calculation
+            ORDER BY ci.added_at DESC;
+        `;
+        const result = await db.query(query, [userId]);
 
-  } catch (err) {
-      console.error(`Error fetching cart for user ${userId}:`, err);
-      res.status(500).json({ error: 'Failed to fetch cart items' });
-  }
+        const cartItemsWithEffectivePrice = result.rows
+            .filter(item => item.supplier_is_active) // Ensure we only process items from active suppliers
+            .map(item => {
+                let basePriceForCalc = parseFloat(item.supplier_base_price);
+                if (item.supplier_is_on_sale && item.supplier_discount_price !== null) {
+                    basePriceForCalc = parseFloat(item.supplier_discount_price);
+                }
+                const adjustment = parseFloat(item.price_adjustment_percentage);
+                const effectivePrice = basePriceForCalc * (1 + adjustment);
+
+                return {
+                    product_id: item.product_id,
+                    quantity: item.quantity,
+                    name: item.master_product_id && item.master_product_display_name ? item.master_product_display_name : item.product_original_name,
+                    image_url: item.master_product_id && item.master_product_image_url ? item.master_product_image_url : item.product_original_image_url,
+                    effective_selling_price: parseFloat(effectivePrice.toFixed(2)),
+                    // Keep original prices if needed for display ("was $X, now $Y")
+                    supplier_base_price: item.supplier_base_price, 
+                    supplier_discount_price: item.supplier_discount_price,
+                    supplier_is_on_sale: item.supplier_is_on_sale
+                };
+            });
+        
+        console.log(`[CART] Fetched ${cartItemsWithEffectivePrice.length} cart items for user ${userId} with effective prices.`);
+        res.json(cartItemsWithEffectivePrice);
+
+    } catch (err) {
+        console.error(`[CART] Error fetching cart for user ${userId}:`, err);
+        res.status(500).json({ error: 'Failed to fetch cart items' });
+    }
 });
+
 app.get('/api/supplier/products', authSupplier, async (req, res) => { // <<< Use middleware
     const supplierId = req.supplier.supplierId; // Get supplierId from decoded JWT
 
@@ -1508,8 +1675,42 @@ app.get('/api/featured-items', async (req, res) => {
                 try {
                     let originalItemResult;
                     if (definition.item_type === 'product') {
-                        originalItemResult = await db.query('SELECT name, description, image_url, price, discount_price, is_on_sale FROM products WHERE id = $1', [definition.item_id]);
-                        if (originalItemResult.rows.length > 0) { const p = originalItemResult.rows[0]; title = title || p.name; description = description || p.description; imageUrl = imageUrl || p.image_url; originalItemData = { price: p.price, discount_price: p.discount_price, is_on_sale: p.is_on_sale };}
+                        // Fetch supplier's base price, discount, sale status, and master adjustment
+                const productDetailQuery = `
+                    SELECT 
+                        p.name, p.description, p.image_url, 
+                        p.price AS supplier_base_price, 
+                        p.discount_price AS supplier_discount_price, 
+                        p.is_on_sale AS supplier_is_on_sale,
+                        COALESCE(mp.current_price_adjustment_percentage, 0.0000) AS price_adjustment_percentage,
+                        mp.display_name AS master_product_display_name,
+                        mp.image_url AS master_product_image_url
+                    FROM products p
+                    LEFT JOIN master_products mp ON p.master_product_id = mp.id
+                    WHERE p.id = $1; 
+                `;
+                // Note: The initial featuredDefinitionsQuery already ensures p.supplier_id links to an active supplier.
+                       originalItemResult = await db.query(productDetailQuery, [definition.item_id]);
+
+                if (originalItemResult.rows.length > 0) { 
+                    const p_orig = originalItemResult.rows[0];
+                    title = title || (p_orig.master_product_display_name || p_orig.name);
+                    description = description || p_orig.description; // Or master_product_description
+                    imageUrl = imageUrl || (p_orig.master_product_image_url || p_orig.image_url);
+                     let basePriceForCalc = parseFloat(p_orig.supplier_base_price);
+                    if (p_orig.supplier_is_on_sale && p_orig.supplier_discount_price !== null) {
+                        basePriceForCalc = parseFloat(p_orig.supplier_discount_price);
+                    }
+                    const adjustment = parseFloat(p_orig.price_adjustment_percentage);
+                    const effectivePrice = basePriceForCalc * (1 + adjustment);
+
+                    originalItemData = { 
+                        effective_selling_price: parseFloat(effectivePrice.toFixed(2)),
+                        // You might want to include original_price if different for display ("Was X, Now Y")
+                        // original_price: parseFloat(p_orig.supplier_base_price).toFixed(2), 
+                        is_on_sale: p_orig.supplier_is_on_sale // Or a more complex logic if effective price < supplier base
+                    };
+                     }
                     } else if (definition.item_type === 'deal') {
                         originalItemResult = await db.query('SELECT title, description, image_url, discount_percentage, end_date FROM deals WHERE id = $1', [definition.item_id]);
                         if (originalItemResult.rows.length > 0) { const d = originalItemResult.rows[0]; title = title || d.title; description = description || d.description; imageUrl = imageUrl || d.image_url; originalItemData = { discount_percentage: d.discount_percentage, end_date: d.end_date };}
