@@ -1187,6 +1187,9 @@ app.post('/api/auth/supplier/login', async (req, res) => {
 // Ensure normalizeTextForMatching function is defined at the top of your file
 // Ensure authSupplier middleware is imported
 
+// Ensure normalizeTextForMatching function is defined above this or imported
+// const normalizeTextForMatching = (inputText) => { /* ... */ };
+
 app.post('/api/supplier/products', authSupplier, async (req, res) => {
     const supplierId = req.supplier.supplierId;
     const { 
@@ -1198,76 +1201,104 @@ app.post('/api/supplier/products', authSupplier, async (req, res) => {
         category, 
         image_url,
         is_on_sale,
-        stock_level 
+        stock_level // This is the correct variable from req.body
     } = req.body;
 
     // --- Validation ---
     if (!name || name.trim() === '') return res.status(400).json({ error: 'Display name is required.' });
     if (!standardized_name_input || standardized_name_input.trim() === '') return res.status(400).json({ error: 'Standardized product name is required.' });
-    const parsedPrice = parseFloat(price); // Parse once for validation and use
-    if (isNaN(parsedPrice) || parsedPrice < 0) return res.status(400).json({ error: 'Valid price is required.' });
+    
+    const parsedPrice = parseFloat(price);
+    if (isNaN(parsedPrice) || parsedPrice < 0) return res.status(400).json({ error: 'Valid price is required and must be non-negative.' });
+    
     if (!category || category.trim() === '') return res.status(400).json({ error: 'Category is required.' });
-    // ... other validations ...
+
+    const parsedDiscountPrice = discount_price ? parseFloat(discount_price) : null;
+    if (parsedDiscountPrice !== null && (isNaN(parsedDiscountPrice) || parsedDiscountPrice < 0)) {
+        return res.status(400).json({ error: 'Invalid discount price. Must be non-negative if provided.' });
+    }
+    if (parsedDiscountPrice !== null && parsedDiscountPrice >= parsedPrice) {
+        return res.status(400).json({ error: 'Discount price must be less than the original price.' });
+    }
+
+    const parsedStockLevel = stock_level !== undefined && stock_level !== null ? parseInt(stock_level, 10) : 0;
+    if (isNaN(parsedStockLevel) || parsedStockLevel < 0) {
+        return res.status(400).json({ error: 'Invalid stock level. Must be a non-negative integer.' });
+    }
+    // --- End Validation ---
 
     const client = await db.pool.connect();
     try {
         await client.query('BEGIN');
 
         const normalizedSupplierStandardName = normalizeTextForMatching(standardized_name_input);
-        let masterProductIdToLink;
-        let linkingStatus;
-        const similarityThreshold = 0.7; 
+        let masterProductIdToLink = null; // Initialize
+        let linkingStatus = 'needs_admin_review'; // Default if no standardized name or no match
+        const similarityThreshold = 0.7; // Tune this threshold (0.0 to 1.0)
 
         if (normalizedSupplierStandardName) {
             const matchMasterQuery = `
                 SELECT id, similarity(standardized_name_normalized, $1) AS sim
                 FROM master_products
-                WHERE similarity(standardized_name_normalized, $1) >= $2
-                ORDER BY sim DESC
+                WHERE similarity(standardized_name_normalized, $1) >= $2 
+                   OR standardized_name_normalized = $1 -- Also check for exact match after normalization
+                ORDER BY sim DESC, 
+                         CASE WHEN standardized_name_normalized = $1 THEN 0 ELSE 1 END -- Prioritize exact match
                 LIMIT 1; 
             `;
             const masterMatchResult = await client.query(matchMasterQuery, [normalizedSupplierStandardName, similarityThreshold]);
 
-            if (masterMatchResult.rows.length > 0) {
+            if (masterMatchResult.rows.length > 0) { // A match >= threshold OR an exact normalized match was found
                 masterProductIdToLink = masterMatchResult.rows[0].id;
                 linkingStatus = 'automatically_linked';
-                console.log(`[PRODUCT_GROUPING] Auto-linking to existing master_product_id: ${masterProductIdToLink} for input: "${standardized_name_input}"`);
-            }
-        }
+                console.log(`[PRODUCT_GROUPING] Auto-linking product "${name}" to existing master_product_id: ${masterProductIdToLink} for input: "${standardized_name_input}" with similarity ${masterMatchResult.rows[0].sim}`);
+            } else {
+                // No strong match, create a new master product
+                console.log(`[PRODUCT_GROUPING] No strong master match for "${standardized_name_input}". Creating new master product.`);
+                const createMasterQuery = `
+                    INSERT INTO master_products (
+                        standardized_name_normalized, 
+                        display_name, 
+                        description, 
+                        image_url, 
+                        brand,
+                        category,
+                        initial_seed_price -- Storing initial supplier price as base_platform_price
+                        -- current_price_adjustment_percentage will use its DB DEFAULT (0.0)
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (standardized_name_normalized) DO NOTHING -- Avoid race condition if another process just created it
+                    RETURNING id;
+                `;
+                // For brand, you might want a separate input or parse from description later
+                const masterValues = [
+                    normalizedSupplierStandardName,
+                    name.trim(), // Use supplier's display name as initial master display name
+                    description || null,
+                    image_url || null,
+                    null, // Placeholder for brand
+                    category.trim(),
+                    parsedPrice // Use the supplier's validated price as the initial base_platform_price
+                ];
+                let newMasterResult = await client.query(createMasterQuery, masterValues);
 
-        if (!masterProductIdToLink && normalizedSupplierStandardName) {
-            console.log(`[PRODUCT_GROUPING] No strong master match for "${standardized_name_input}". Creating new master product.`);
-            // --- MODIFIED: Insert into master_products with initial_seed_price ---
-            // current_price_adjustment_percentage will use its DB DEFAULT (0.0000)
-            const createMasterQuery = `
-                INSERT INTO master_products (
-                    standardized_name_normalized, 
-                    display_name, 
-                    description, 
-                    image_url, 
-                    brand,
-                    category,
-                    initial_seed_price -- <<< Ensure this column exists in master_products
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING id;
-            `;
-            const masterValues = [
-                normalizedSupplierStandardName,
-                name.trim(),
-                description || null,
-                image_url || null,
-                null, // Placeholder for brand
-                category.trim(),
-                parsedPrice // Use the validated and parsed price for initial_seed_price
-            ];
-            const newMasterResult = await client.query(createMasterQuery, masterValues);
-            masterProductIdToLink = newMasterResult.rows[0].id;
-            linkingStatus = 'auto_master_created';
-            console.log(`[PRODUCT_GROUPING] New master_product_id created: ${masterProductIdToLink}, initial_seed_price set to ${parsedPrice}`);
-        } else if (!normalizedSupplierStandardName) {
-            linkingStatus = 'needs_admin_review';
+                if (newMasterResult.rows.length === 0) {
+                    // This means ON CONFLICT DO NOTHING happened. The master product was likely just created by a concurrent request.
+                    // Try to fetch it again.
+                    console.log(`[PRODUCT_GROUPING] Master product with normalized name "${normalizedSupplierStandardName}" likely created concurrently. Fetching it.`);
+                    newMasterResult = await client.query('SELECT id FROM master_products WHERE standardized_name_normalized = $1', [normalizedSupplierStandardName]);
+                    if (newMasterResult.rows.length === 0) {
+                         // This should be very rare if the ON CONFLICT logic is sound.
+                        throw new Error('Failed to create or retrieve master product after ON CONFLICT.');
+                    }
+                }
+                masterProductIdToLink = newMasterResult.rows[0].id;
+                linkingStatus = 'auto_master_created'; // Or 'automatically_linked' if we consider it immediately linked
+                console.log(`[PRODUCT_GROUPING] New/Existing master_product_id set: ${masterProductIdToLink}, base_platform_price set to ${parsedPrice}`);
+            }
+        } else { // No standardized_name_input provided by supplier
+            linkingStatus = 'needs_admin_review'; // Requires admin to provide standardized name and link
             masterProductIdToLink = null;
-            console.log(`[PRODUCT_GROUPING] No standardized_name_input provided. Status: 'needs_admin_review'`);
+            console.log(`[PRODUCT_GROUPING] No standardized_name_input provided by supplier. Status: 'needs_admin_review'`);
         }
 
         const insertProductQuery = `
@@ -1279,12 +1310,13 @@ app.post('/api/supplier/products', authSupplier, async (req, res) => {
             RETURNING *;
         `;
         const productValues = [
-            supplierId, name.trim(), standardized_name_input, description || null,
+            supplierId, name.trim(), standardized_name_input.trim(), // Store trimmed original standardized input
+            description || null,
             parsedPrice, // Use the already parsed price
-            discount_price ? parseFloat(discount_price) : null,
+            parsedDiscountPrice, // Use the already parsed (or null) discount price
             category.trim(), image_url || null,
             is_on_sale === undefined ? false : Boolean(is_on_sale),
-            stock_price ? parseInt(stock_level, 10) : 0, // Corrected from stock_price to stock_level
+            parsedStockLevel, // Use the corrected and parsed stock_level
             masterProductIdToLink,
             linkingStatus
         ];
@@ -1298,9 +1330,10 @@ app.post('/api/supplier/products', authSupplier, async (req, res) => {
     } catch (err) {
         if (client) await client.query('ROLLBACK');
         console.error(`[SUPPLIER_PRODUCT_ADD] Error creating product for supplier ${supplierId}:`, err);
-        if (err.constraint === 'master_products_standardized_name_normalized_key' && err.code === '23505') {
-             console.error("[PRODUCT_GROUPING] Unique constraint violation on master_products.standardized_name_normalized. This might indicate a race condition or a missed match.");
-             return res.status(409).json({ error: 'A master product with this standardized name already exists. Admin review may be needed.' });
+        // Check for unique constraint violation on master_products standardized_name_normalized
+        if (err.code === '23505' && err.constraint === 'master_products_standardized_name_normalized_key') {
+             console.error("[PRODUCT_GROUPING] Unique constraint violation on master_products.standardized_name_normalized during insert. This shouldn't happen if ON CONFLICT is used correctly or if logic to fetch existing is sound.");
+             return res.status(409).json({ error: 'A master product with this standardized name likely already exists or there was a conflict. Please try again or contact admin.' });
         }
         res.status(500).json({ error: 'Failed to create product.' });
     } finally {
