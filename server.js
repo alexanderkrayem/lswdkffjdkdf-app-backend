@@ -2854,6 +2854,139 @@ app.delete('/api/admin/featured-items-definitions/:featureId', authAdmin, async 
     }
 });
 
+
+
+// telegram-app-backend/server.js
+// Ensure these are at the top:
+// const db = require('./config/db');
+// const authSupplier = require('./middleware/authSupplier');
+// const bcrypt = require('bcrypt');
+// const jwt = require('jsonwebtoken'); // Not needed for these specific routes, but for auth in general
+
+// ... (existing routes for supplier auth, supplier products, supplier deals) ...
+
+// --- SUPPLIER MANAGEMENT OF THEIR DELIVERY AGENTS ---
+
+// POST /api/supplier/delivery-agents - Supplier creates a new delivery agent for their company
+app.post('/api/supplier/delivery-agents', authSupplier, async (req, res) => {
+    const supplierId = req.supplier.supplierId; // From authenticated supplier's JWT
+    const {
+        full_name,
+        phone_number, // Required, unique
+        password,     // Required
+        email,        // Optional, unique if provided
+        telegram_user_id // Optional, unique if provided
+    } = req.body;
+
+    // --- Validation ---
+    if (!full_name || full_name.trim() === '') {
+        return res.status(400).json({ error: 'Full name is required.' });
+    }
+    if (!phone_number || phone_number.trim() === '') {
+        return res.status(400).json({ error: 'Phone number is required.' });
+    }
+    if (!password || password.length < 6) { // Basic password length check
+        return res.status(400).json({ error: 'Password is required and must be at least 6 characters.' });
+    }
+    if (email && email.trim() === '') { // If email provided, it shouldn't be empty
+        return res.status(400).json({ error: 'Email cannot be empty if provided.' });
+    }
+    if (telegram_user_id && isNaN(parseInt(telegram_user_id, 10))) {
+        return res.status(400).json({ error: 'Invalid Telegram User ID format.' });
+    }
+    // Add more specific validation for phone, email format if needed
+
+    try {
+        // Hash the password
+        const saltRounds = 10;
+        const hashedPassword = await bcrypt.hash(password, saltRounds);
+
+        const insertQuery = `
+            INSERT INTO delivery_agents (
+                supplier_id, full_name, phone_number, password_hash, email, telegram_user_id, is_active
+            ) VALUES ($1, $2, $3, $4, $5, $6, TRUE) -- New agents are active by default
+            RETURNING id, supplier_id, full_name, phone_number, email, telegram_user_id, is_active, created_at;
+        `;
+        const values = [
+            supplierId,
+            full_name.trim(),
+            phone_number.trim(),
+            hashedPassword,
+            email ? email.toLowerCase().trim() : null,
+            telegram_user_id ? parseInt(telegram_user_id, 10) : null
+        ];
+
+        const result = await db.query(insertQuery, values);
+        
+        console.log(`[DELIVERY_AGENT_MGMT] New delivery agent ID ${result.rows[0].id} created by supplier ID ${supplierId}`);
+        res.status(201).json(result.rows[0]); // Return the created agent (without password_hash)
+
+    } catch (err) {
+        console.error(`[DELIVERY_AGENT_MGMT] Error creating delivery agent for supplier ${supplierId}:`, err);
+        if (err.code === '23505') { // Unique constraint violation (e.g., phone_number, email, or telegram_user_id)
+            if (err.constraint && err.constraint.includes('phone_number')) {
+                return res.status(409).json({ error: 'This phone number is already registered.' });
+            }
+            if (err.constraint && err.constraint.includes('email')) {
+                return res.status(409).json({ error: 'This email address is already registered.' });
+            }
+             if (err.constraint && err.constraint.includes('telegram_user_id')) {
+                return res.status(409).json({ error: 'This Telegram account is already registered as an agent.' });
+            }
+            return res.status(409).json({ error: 'A delivery agent with some of these unique details already exists.' });
+        }
+        res.status(500).json({ error: 'Failed to create delivery agent.' });
+    }
+});
+
+
+// GET /api/supplier/delivery-agents - Supplier lists their own delivery agents
+app.get('/api/supplier/delivery-agents', authSupplier, async (req, res) => {
+    const supplierId = req.supplier.supplierId;
+
+    // Pagination (optional for now, can add later if a supplier has many agents)
+    // const page = parseInt(req.query.page, 10) || 1;
+    // const limit = parseInt(req.query.limit, 10) || 10;
+    // const offset = (page - 1) * limit;
+
+    try {
+        const query = `
+            SELECT id, full_name, phone_number, email, telegram_user_id, is_active, created_at 
+            FROM delivery_agents
+            WHERE supplier_id = $1
+            ORDER BY created_at DESC;
+            -- LIMIT $2 OFFSET $3; -- For pagination
+        `;
+        // const result = await db.query(query, [supplierId, limit, offset]);
+        const result = await db.query(query, [supplierId]); // Simpler without pagination for now
+
+        // const countQuery = 'SELECT COUNT(*) AS total_items FROM delivery_agents WHERE supplier_id = $1';
+        // const countResult = await db.query(countQuery, [supplierId]);
+        // const totalItems = parseInt(countResult.rows[0].total_items, 10);
+        // const totalPages = Math.ceil(totalItems / limit);
+
+        res.json({
+            items: result.rows,
+            // currentPage: page,
+            // totalPages: totalPages,
+            // totalItems: totalItems
+        });
+        // For simpler response if not paginating: res.json(result.rows);
+
+    } catch (err) {
+        console.error(`[DELIVERY_AGENT_MGMT] Error fetching delivery agents for supplier ${supplierId}:`, err);
+        res.status(500).json({ error: 'Failed to fetch delivery agents.' });
+    }
+});
+
+
+// TODO LATER for Supplier Panel:
+// PUT /api/supplier/delivery-agents/:agentId (authSupplier) - Update an agent's details (name, phone, email, is_active)
+// DELETE /api/supplier/delivery-agents/:agentId (authSupplier) - Delete an agent
+// PUT /api/supplier/delivery-agents/:agentId/reset-password (authSupplier) - More complex password reset flow
+
+// ... (app.listen) ...
+
 // --- Cron Job Scheduling ---
 // Example: Run every hour at the 0th minute.
 // For testing, you might use '*/1 * * * *' (every minute) - BE CAREFUL with frequent DB updates.
