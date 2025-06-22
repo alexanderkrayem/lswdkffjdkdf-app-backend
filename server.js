@@ -11,6 +11,8 @@ const PORT = process.env.PORT || 3001; // Use port from .env or default to 3001
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const authAdmin = require('./middleware/authAdmin'); // IMPORT THIS
+const authDeliveryAgent = require('./middleware/authDeliveryAgent'); // IMPORT
+const crypto = require('crypto'); // For HMAC SHA256 verification
 
 const normalizeTextForMatching = (inputText) => {
     if (typeof inputText !== 'string' || !inputText) {
@@ -857,7 +859,7 @@ app.post('/api/orders', async (req, res) => {
             ).join(', ')};
         `;
         const orderItemsValues = orderItemsData.reduce((acc, item) => {
-            acc.push(newOrderId, item.productId, item.quantity, item.priceAtTimeOfOrder, 'pending'); // Default item status
+            acc.push(newOrderId, item.productId, item.quantity, item.price_at_time_of_order, 'pending'); // Default item status
             return acc;
         }, []);
         await client.query(orderItemsInsertQuery, orderItemsValues);
@@ -2979,13 +2981,513 @@ app.get('/api/supplier/delivery-agents', authSupplier, async (req, res) => {
     }
 });
 
+// telegram-app-backend/server.js
+// Ensure authSupplier is imported
 
+// PUT - Supplier updates one of their own delivery agents
+app.put('/api/supplier/delivery-agents/:agentId', authSupplier, async (req, res) => {
+    const supplierId = req.supplier.supplierId;
+    const { agentId } = req.params;
+    const parsedAgentId = parseInt(agentId, 10);
+
+    const {
+        full_name,
+        phone_number, // Should be unique
+        email,        // Optional, should be unique if provided
+        telegram_user_id, // Optional, should be unique if provided
+        // Password changes should ideally be a separate, more secure endpoint/flow
+        // is_active is handled by a separate toggle endpoint
+    } = req.body;
+
+    if (isNaN(parsedAgentId)) {
+        return res.status(400).json({ error: 'Invalid Delivery Agent ID format.' });
+    }
+
+    // Basic validation for fields being updated
+    if (!full_name || full_name.trim() === '') {
+        return res.status(400).json({ error: 'Full name is required.' });
+    }
+    if (!phone_number || phone_number.trim() === '') {
+        return res.status(400).json({ error: 'Phone number is required.' });
+    }
+    // Add more specific validations for phone, email, telegram_user_id formats if necessary
+
+    try {
+        // Check if agent exists and belongs to this supplier
+        const agentCheckResult = await db.query(
+            'SELECT id FROM delivery_agents WHERE id = $1 AND supplier_id = $2',
+            [parsedAgentId, supplierId]
+        );
+
+        if (agentCheckResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Delivery agent not found or you do not have permission to edit it.' });
+        }
+
+        // Construct SET clause dynamically based on provided fields
+        const fieldsToUpdate = {};
+        if (full_name !== undefined) fieldsToUpdate.full_name = full_name.trim();
+        if (phone_number !== undefined) fieldsToUpdate.phone_number = phone_number.trim();
+        if (email !== undefined) fieldsToUpdate.email = email ? email.toLowerCase().trim() : null;
+        if (telegram_user_id !== undefined) fieldsToUpdate.telegram_user_id = telegram_user_id ? parseInt(telegram_user_id, 10) : null;
+        
+        if (Object.keys(fieldsToUpdate).length === 0) {
+            return res.status(400).json({ error: 'No fields provided for update.' });
+        }
+        
+        fieldsToUpdate.updated_at = new Date(); // Manual update, or rely on trigger
+
+        const setClauses = Object.keys(fieldsToUpdate).map((key, index) => `${key} = $${index + 1}`).join(', ');
+        const values = Object.values(fieldsToUpdate);
+        values.push(parsedAgentId); // For WHERE id = $N
+        values.push(supplierId);    // For WHERE supplier_id = $N+1
+
+        const updateQuery = `
+            UPDATE delivery_agents 
+            SET ${setClauses}
+            WHERE id = $${values.length - 1} AND supplier_id = $${values.length}
+            RETURNING id, supplier_id, full_name, phone_number, email, telegram_user_id, is_active, created_at, updated_at;
+        `;
+
+        const result = await db.query(updateQuery, values);
+        
+        console.log(`[DELIVERY_AGENT_MGMT] Delivery agent ID ${result.rows[0].id} updated by supplier ID ${supplierId}`);
+        res.status(200).json(result.rows[0]);
+
+    } catch (err) {
+        console.error(`[DELIVERY_AGENT_MGMT] Error updating delivery agent ${parsedAgentId} for supplier ${supplierId}:`, err);
+        if (err.code === '23505') { // Unique constraint violation
+             if (err.constraint && err.constraint.includes('phone_number')) return res.status(409).json({ error: 'This phone number is already in use by another agent.' });
+             if (err.constraint && err.constraint.includes('email')) return res.status(409).json({ error: 'This email is already in use by another agent.' });
+             if (err.constraint && err.constraint.includes('telegram_user_id')) return res.status(409).json({ error: 'This Telegram ID is already in use by another agent.' });
+            return res.status(409).json({ error: 'A unique detail (phone, email, or Telegram ID) is already in use.' });
+        }
+        res.status(500).json({ error: 'Failed to update delivery agent.' });
+    }
+});
+
+// telegram-app-backend/server.js
+app.delete('/api/supplier/delivery-agents/:agentId', authSupplier, async (req, res) => { // START OF BLOCK
+    const supplierId = req.supplier.supplierId;
+    const { agentId } = req.params;
+    const parsedAgentId = parseInt(agentId, 10);
+
+    if (isNaN(parsedAgentId)) {
+        return res.status(400).json({ error: 'Invalid Delivery Agent ID format.' });
+    }
+
+    try { // try block starts
+        const deleteQuery = `
+            DELETE FROM delivery_agents 
+            WHERE id = $1 AND supplier_id = $2 
+            RETURNING id;
+        `;
+        const result = await db.query(deleteQuery, [parsedAgentId, supplierId]);
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Delivery agent not found or you do not have permission to delete it.' });
+        }
+
+        console.log(`[DELIVERY_AGENT_MGMT] Delivery agent ID ${parsedAgentId} deleted by supplier ID ${supplierId}`);
+        res.status(200).json({ message: 'Delivery agent deleted successfully.', deletedAgentId: parsedAgentId });
+
+    } catch (err) { // catch block starts
+        console.error(`[DELIVERY_AGENT_MGMT] Error deleting delivery agent ${parsedAgentId} for supplier ${supplierId}:`, err);
+        res.status(500).json({ error: 'Failed to delete delivery agent.' });
+    } // catch block ends
+}); // END OF BLOCK (closing parenthesis for async (req, res) => { ... } and closing semicolon for app.delete)
+
+// telegram-app-backend/server.js
+
+app.put('/api/supplier/delivery-agents/:agentId/toggle-active', authSupplier, async (req, res) => {
+    const supplierId = req.supplier.supplierId;
+    const { agentId } = req.params;
+    const parsedAgentId = parseInt(agentId, 10);
+
+    if (isNaN(parsedAgentId)) {
+        return res.status(400).json({ error: 'Invalid Delivery Agent ID format.' });
+    }
+
+    try {
+        const agentCheckResult = await db.query(
+            'SELECT is_active FROM delivery_agents WHERE id = $1 AND supplier_id = $2',
+            [parsedAgentId, supplierId]
+        );
+
+        if (agentCheckResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Delivery agent not found or you do not have permission to modify it.' });
+        }
+
+        const currentStatus = agentCheckResult.rows[0].is_active;
+        const newStatus = !currentStatus;
+
+        const updateResult = await db.query(
+            'UPDATE delivery_agents SET is_active = $1, updated_at = NOW() WHERE id = $2 AND supplier_id = $3 RETURNING *', // Return full updated agent
+            [newStatus, parsedAgentId, supplierId]
+        );
+        // Remove updated_at = NOW() if trigger exists
+
+        console.log(`[DELIVERY_AGENT_MGMT] Agent ID ${parsedAgentId} status toggled to ${newStatus} by supplier ID ${supplierId}`);
+        res.status(200).json(updateResult.rows[0]);
+
+    } catch (err) {
+        console.error(`[DELIVERY_AGENT_MGMT] Error toggling status for agent ${parsedAgentId} by supplier ${supplierId}:`, err);
+        res.status(500).json({ error: 'Failed to update agent status.' });
+    }
+});
 // TODO LATER for Supplier Panel:
 // PUT /api/supplier/delivery-agents/:agentId (authSupplier) - Update an agent's details (name, phone, email, is_active)
 // DELETE /api/supplier/delivery-agents/:agentId (authSupplier) - Delete an agent
 // PUT /api/supplier/delivery-agents/:agentId/reset-password (authSupplier) - More complex password reset flow
 
+// telegram-app-backend/server.js
+// Ensure bcrypt and jwt are imported
+
+app.post('/api/auth/delivery/login', async (req, res) => {
+    const { phoneNumber, password } = req.body; // Using phone_number for login
+
+    if (!phoneNumber || !password) {
+        return res.status(400).json({ error: 'Phone number and password are required.' });
+    }
+
+    try {
+        // Fetch agent and their supplier's status
+        const agentQuery = `
+            SELECT 
+                da.id, da.full_name, da.phone_number, da.password_hash, da.is_active AS agent_is_active,
+                da.supplier_id, s.is_active AS supplier_is_active
+            FROM delivery_agents da
+            JOIN suppliers s ON da.supplier_id = s.id
+            WHERE da.phone_number = $1;
+        `;
+        const agentResult = await db.query(agentQuery, [phoneNumber.trim()]);
+
+        if (agentResult.rows.length === 0) {
+            return res.status(401).json({ error: 'Invalid credentials or agent not found.' });
+        }
+
+        const agent = agentResult.rows[0];
+
+        if (!agent.agent_is_active) {
+            return res.status(403).json({ error: 'Your agent account is inactive. Please contact your supplier.' });
+        }
+        if (!agent.supplier_is_active) {
+            return res.status(403).json({ error: 'Your employing supplier account is inactive. Please contact them.' });
+        }
+
+        const match = await bcrypt.compare(password, agent.password_hash);
+        if (!match) {
+            return res.status(401).json({ error: 'Invalid credentials.' });
+        }
+
+        // Generate JWT for Delivery Agent
+        const tokenPayload = {
+            deliveryAgentId: agent.id,
+            supplierId: agent.supplier_id, // Useful to have in token
+            name: agent.full_name,
+            role: 'delivery_agent' // Explicit role
+        };
+        console.log("[DELIVERY_AUTH] Attempting to sign JWT. Secret from env:", process.env.JWT_DELIVERY_SECRET);
+        const token = jwt.sign(tokenPayload, process.env.JWT_DELIVERY_SECRET, { expiresIn: '1d' }); // Use specific secret
+
+        res.json({
+            message: 'Delivery agent login successful',
+            token,
+            agent: {
+                id: agent.id,
+                name: agent.full_name,
+                phoneNumber: agent.phone_number,
+                supplierId: agent.supplier_id
+            }
+        });
+
+    } catch (err) {
+        console.error('[DELIVERY_AUTH] Login error:', err);
+        res.status(500).json({ error: 'Internal server error during login.' });
+    }
+});
+
+// telegram-app-backend/server.js
+
+
+// telegram-app-backend/server.js
+// Ensure authDeliveryAgent is imported: const authDeliveryAgent = require('./middleware/authDeliveryAgent');
+// Ensure db is available: const db = require('./config/db');
+
+app.get('/api/delivery/assigned-items', authDeliveryAgent, async (req, res) => {
+    const deliveryAgentId = req.deliveryAgent.deliveryAgentId;
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 15; // Default items per page
+    const offset = (page - 1) * limit;
+
+    // Default statuses if none provided by client via query param "statuses"
+    let targetStatuses = ['assigned_to_agent', 'out_for_delivery']; // Default active tasks
+
+    if (req.query.statuses) {
+        const requestedStatuses = req.query.statuses.split(',').map(s => s.trim()).filter(s => s); // Trim and filter empty strings
+        
+        // Validate against a list of all possible/allowed statuses for security/correctness
+        const allowedDeliveryItemStatuses = [
+            'pending_assignment', // Should not typically be fetched by agent, but good to list all
+            'assigned_to_agent', 
+            'out_for_delivery', 
+            'delivered', 
+            'delivery_failed', 
+            'payment_pending', 
+            'returned'
+        ];
+        
+        const validRequestedStatuses = requestedStatuses.filter(s => allowedDeliveryItemStatuses.includes(s));
+        
+        if (validRequestedStatuses.length > 0) {
+            targetStatuses = validRequestedStatuses;
+        } else if (requestedStatuses.length > 0 && validRequestedStatuses.length === 0) {
+            // If statuses were provided but none were valid, return empty or error
+            // For now, let's return empty for invalid filter. Or could default.
+             console.log(`[DELIVERY_APP] Agent ${deliveryAgentId} requested invalid statuses: ${req.query.statuses}. Returning empty.`);
+            return res.json({ items: [], currentPage: 1, totalPages: 0, totalItems: 0, currentFilterStatuses: [] });
+        }
+        // If req.query.statuses was empty string after split/trim, it defaults to targetStatuses
+    }
+    
+    console.log(`[DELIVERY_APP] Agent ${deliveryAgentId} fetching items with statuses: ${targetStatuses.join(', ')} for page ${page}`);
+
+    try {
+        const itemsQuery = `
+            SELECT 
+                oi.id AS order_item_id, oi.quantity, oi.price_at_time_of_order,
+                oi.delivery_item_status, oi.delivery_notes, oi.item_payment_collected, oi.item_delivered_at,
+                p.name AS product_name, p.image_url AS product_image_url, p.description AS product_description,
+                o.id AS order_id, o.order_date, o.delivery_status AS overall_order_delivery_status,
+                up.full_name AS customer_name, up.phone_number AS customer_phone,
+                up.address_line1 AS customer_address1, up.address_line2 AS customer_address2, up.city AS customer_city,
+                (oi.quantity * oi.price_at_time_of_order) AS item_total_value 
+            FROM order_items oi
+            JOIN products p ON oi.product_id = p.id
+            JOIN orders o ON oi.order_id = o.id
+            JOIN user_profiles up ON o.user_id = up.user_id
+            WHERE oi.assigned_delivery_agent_id = $1
+              AND oi.delivery_item_status = ANY($2::varchar[]) -- Use ANY for array of statuses
+            ORDER BY 
+                -- Custom sort to prioritize actionable items, then by date
+                CASE oi.delivery_item_status
+                    WHEN 'assigned_to_agent' THEN 1
+                    WHEN 'out_for_delivery' THEN 2
+                    WHEN 'payment_pending' THEN 3  -- Higher priority than failed/delivered
+                    WHEN 'delivery_failed' THEN 4
+                    WHEN 'delivered' THEN 5 
+                    ELSE 6
+                END ASC,
+                o.order_date ASC, -- Older orders/items first within same status group
+                o.id ASC, 
+                oi.id ASC
+            LIMIT $3 OFFSET $4;
+        `;
+        
+        const itemsResult = await db.query(itemsQuery, [deliveryAgentId, targetStatuses, limit, offset]);
+        
+        const countQuery = `
+            SELECT COUNT(*) AS total_items
+            FROM order_items oi
+            WHERE oi.assigned_delivery_agent_id = $1
+              AND oi.delivery_item_status = ANY($2::varchar[]);
+        `;
+        const countResult = await db.query(countQuery, [deliveryAgentId, targetStatuses]);
+        const totalItems = parseInt(countResult.rows[0].total_items, 10);
+        const totalPages = Math.ceil(totalItems / limit);
+
+        res.json({
+            items: itemsResult.rows,
+            currentPage: page,
+            totalPages: totalPages,
+            totalItems: totalItems,
+            currentFilterStatuses: targetStatuses // Echo back the statuses that were actually used
+        });
+
+    } catch (err) {
+        console.error(`[DELIVERY_APP] Error fetching assigned items for agent ${deliveryAgentId} with statuses ${targetStatuses.join(',')}:`, err);
+        res.status(500).json({ error: 'Failed to fetch assigned delivery items.' });
+    }
+});
+
+
+// telegram-app-backend/server.js
+
+app.put('/api/delivery/order-items/:orderItemId/status', authDeliveryAgent, async (req, res) => {
+    const deliveryAgentId = req.deliveryAgent.deliveryAgentId;
+    const { orderItemId } = req.params;
+    const parsedOrderItemId = parseInt(orderItemId, 10);
+    const { newStatus, notes, paymentCollected } = req.body;
+
+    // Validate newStatus against allowed values
+    const allowedStatuses = ['out_for_delivery', 'delivered', 'delivery_failed', 'payment_pending'];
+    if (!newStatus || !allowedStatuses.includes(newStatus)) {
+        return res.status(400).json({ error: `Invalid new status. Must be one of: ${allowedStatuses.join(', ')}` });
+    }
+    if (isNaN(parsedOrderItemId)) {
+        return res.status(400).json({ error: 'Invalid Order Item ID.' });
+    }
+
+    const client = await db.pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Verify item is assigned to this agent
+        const checkQuery = 'SELECT id, order_id FROM order_items WHERE id = $1 AND assigned_delivery_agent_id = $2';
+        const checkResult = await client.query(checkQuery, [parsedOrderItemId, deliveryAgentId]);
+
+        if (checkResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(403).json({ error: 'Order item not found or not assigned to you.' });
+        }
+        
+        const order_id = checkResult.rows[0].order_id; // Get order_id for potential overall status update
+
+        // Update the order item
+        let updateQuery = 'UPDATE order_items SET delivery_item_status = $1';
+        const queryParams = [newStatus];
+        let paramCount = 1;
+
+        if (notes !== undefined) {
+            updateQuery += `, delivery_notes = $${++paramCount}`;
+            queryParams.push(notes);
+        }
+        if (paymentCollected !== undefined) {
+            updateQuery += `, item_payment_collected = $${++paramCount}`;
+            queryParams.push(Boolean(paymentCollected));
+        }
+        if (newStatus === 'delivered') {
+            updateQuery += `, item_delivered_at = NOW()`; // Set delivery timestamp
+        }
+        
+        updateQuery += ` WHERE id = $${++paramCount} RETURNING *;`;
+        queryParams.push(parsedOrderItemId);
+
+        const result = await client.query(updateQuery, queryParams);
+
+        // TODO LATER: After item status update, check if all items in the order (or all items from this supplier in the order)
+        // have reached a final status, and if so, update the main orders.delivery_status.
+        // This can be complex if an order has items from multiple suppliers.
+        // For now, we just update the item.
+
+        await client.query('COMMIT');
+        console.log(`[DELIVERY_APP] Item ${parsedOrderItemId} status updated to ${newStatus} by agent ${deliveryAgentId}`);
+        res.status(200).json(result.rows[0]);
+
+    } catch (err) {
+        if (client) await client.query('ROLLBACK');
+        console.error(`[DELIVERY_APP] Error updating status for item ${parsedOrderItemId}:`, err);
+        res.status(500).json({ error: 'Failed to update item status.' });
+    } finally {
+        if (client) client.release();
+    }
+});
 // ... (app.listen) ...
+app.post('/api/auth/delivery/verify-telegram', async (req, res) => {
+    const { initData } = req.body;
+
+    if (!initData) {
+        return res.status(400).json({ error: 'initData is required.' });
+    }
+
+    // --- 1. Validate initData ---
+    // (Refer to Telegram's documentation for the most up-to-date validation method)
+    // The general idea is to check the hash parameter against a calculated hash.
+    const params = new URLSearchParams(initData);
+    const hash = params.get('hash');
+    params.delete('hash'); // Remove hash from params before sorting and stringifying
+
+    // Sort parameters alphabetically by key
+    const sortedParams = Array.from(params.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+    const dataCheckString = sortedParams.map(([key, value]) => `${key}=${value}`).join('\n');
+
+    if (!process.env.TELEGRAM_BOT_TOKEN) {
+        console.error("[VERIFY_TG_AUTH] TELEGRAM_BOT_TOKEN is not set in .env!");
+        return res.status(500).json({ error: "Server configuration error." });
+    }
+
+    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(process.env.TELEGRAM_BOT_TOKEN).digest();
+    const calculatedHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+
+    if (calculatedHash !== hash) {
+        console.warn("[VERIFY_TG_AUTH] initData hash validation failed.", { receivedHash: hash, calculatedHash });
+        return res.status(403).json({ error: 'Invalid initData: Hash mismatch.' });
+    }
+    console.log("[VERIFY_TG_AUTH] initData hash validated successfully.");
+
+    // --- 2. Extract User Information ---
+    const userParam = params.get('user');
+    if (!userParam) {
+        return res.status(400).json({ error: 'User data not found in initData.' });
+    }
+
+    let telegramUser;
+    try {
+        telegramUser = JSON.parse(userParam);
+    } catch (e) {
+        return res.status(400).json({ error: 'Invalid user data format in initData.' });
+    }
+
+    if (!telegramUser || !telegramUser.id) {
+        return res.status(400).json({ error: 'Telegram User ID not found.' });
+    }
+    const telegramUserId = telegramUser.id;
+    console.log(`[VERIFY_TG_AUTH] Attempting login for Telegram User ID: ${telegramUserId}`);
+
+    // --- 3. Find Delivery Agent by Telegram User ID & Check Statuses ---
+    try {
+        const agentQuery = `
+            SELECT 
+                da.id, da.full_name, da.phone_number, da.is_active AS agent_is_active,
+                da.supplier_id, s.is_active AS supplier_is_active, s.name as supplier_name
+            FROM delivery_agents da
+            JOIN suppliers s ON da.supplier_id = s.id
+            WHERE da.telegram_user_id = $1;
+        `;
+        const agentResult = await db.query(agentQuery, [telegramUserId]);
+
+        if (agentResult.rows.length === 0) {
+            console.log(`[VERIFY_TG_AUTH] No delivery agent found for Telegram User ID: ${telegramUserId}`);
+            return res.status(404).json({ error: 'Not registered as a delivery agent with this Telegram account.' });
+        }
+
+        const agent = agentResult.rows[0];
+
+        if (!agent.agent_is_active) {
+            return res.status(403).json({ error: 'Your agent account is inactive. Please contact your supplier.' });
+        }
+        if (!agent.supplier_is_active) {
+            return res.status(403).json({ error: 'Your employing supplier account is inactive. Please contact them.' });
+        }
+
+        // --- 4. Generate JWT ---
+        const tokenPayload = {
+            deliveryAgentId: agent.id,
+            supplierId: agent.supplier_id,
+            name: agent.full_name,
+            role: 'delivery_agent',
+            telegramUserId: telegramUserId // Include TG ID in token if useful
+        };
+        const token = jwt.sign(tokenPayload, process.env.JWT_DELIVERY_SECRET, { expiresIn: '1d' });
+
+        res.json({
+            message: 'Telegram login successful for delivery agent.',
+            token,
+            agent: {
+                id: agent.id,
+                name: agent.full_name,
+                phoneNumber: agent.phone_number, // May be null if not set
+                supplierId: agent.supplier_id,
+                supplierName: agent.supplier_name, // Added for frontend convenience
+                telegramUserId: telegramUserId
+            }
+        });
+
+    } catch (dbError) {
+        console.error('[VERIFY_TG_AUTH] Database or JWT error:', dbError);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
 
 // --- Cron Job Scheduling ---
 // Example: Run every hour at the 0th minute.
