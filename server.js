@@ -3489,6 +3489,118 @@ app.post('/api/auth/delivery/verify-telegram', async (req, res) => {
     }
 });
 
+// Add this new route to your backend server file (e.g., server.js)
+
+app.get('/api/favorites/product-details/:productId', async (req, res) => {
+    const { productId } = req.params;
+    const parsedProductId = parseInt(productId, 10);
+
+    if (isNaN(parsedProductId)) {
+        return res.status(400).json({ error: 'Invalid Product ID.' });
+    }
+
+    console.log(`[FAVORITE_DETAILS] Fetching details for favorited product ID: ${parsedProductId}`);
+
+    try {
+        // Step 1: Fetch the originally favorited product to get its details, supplier status, and master_product_id.
+        const originalProductQuery = `
+            SELECT 
+                p.id, p.name, p.description, p.price AS supplier_base_price, 
+                p.discount_price AS supplier_discount_price, p.is_on_sale AS supplier_is_on_sale,
+                p.category, p.image_url, p.stock_level, p.supplier_id, p.master_product_id,
+                s.name as supplier_name,
+                s.is_active as supplier_is_active, -- This is the key field!
+                COALESCE(mp.current_price_adjustment_percentage, 0.0000) AS price_adjustment_percentage,
+                mp.display_name AS master_product_display_name,
+                mp.image_url AS master_product_image_url
+            FROM products p
+            JOIN suppliers s ON p.supplier_id = s.id
+            LEFT JOIN master_products mp ON p.master_product_id = mp.id
+            WHERE p.id = $1;
+        `;
+        const originalProductResult = await db.query(originalProductQuery, [parsedProductId]);
+        
+        if (originalProductResult.rows.length === 0) {
+            // This case handles if the product was somehow deleted despite the plan. It's a good fallback.
+            return res.status(404).json({ 
+                error: 'المنتج الأصلي الذي أضفته للمفضلة لم يعد موجوداً.',
+                isAvailable: false,
+                originalProduct: null,
+                alternatives: []
+            });
+        }
+        
+        const originalProduct = originalProductResult.rows[0];
+
+        // --- Calculate effective price and determine display name/image for the original product ---
+        let basePriceForCalc = parseFloat(originalProduct.supplier_base_price);
+        if (originalProduct.supplier_is_on_sale && originalProduct.supplier_discount_price !== null) {
+            basePriceForCalc = parseFloat(originalProduct.supplier_discount_price);
+        }
+        const adjustment = parseFloat(originalProduct.price_adjustment_percentage);
+        originalProduct.effective_selling_price = parseFloat((basePriceForCalc * (1 + adjustment)).toFixed(2));
+        originalProduct.name = originalProduct.master_product_display_name || originalProduct.name;
+        originalProduct.image_url = originalProduct.master_product_image_url || originalProduct.image_url;
+
+        // --- Determine availability and get master ID ---
+        const masterProductId = originalProduct.master_product_id;
+        const isOriginalAvailable = originalProduct.supplier_is_active && originalProduct.stock_level > 0; // The availability is determined by this flag.
+
+        // Step 2: Fetch available alternatives from *other* active suppliers.
+        let alternatives = [];
+        if (masterProductId) {
+            const alternativesQuery = `
+                SELECT 
+                    p.id, p.name, p.price AS supplier_base_price, p.discount_price AS supplier_discount_price,
+                    p.is_on_sale AS supplier_is_on_sale, p.image_url,
+                    s.id as supplier_id, s.name as supplier_name,
+                    COALESCE(mp.current_price_adjustment_percentage, 0.0000) AS price_adjustment_percentage,
+                    mp.display_name AS master_product_display_name,
+                    mp.image_url AS master_product_image_url
+                FROM products p
+                JOIN suppliers s ON p.supplier_id = s.id
+                LEFT JOIN master_products mp ON p.master_product_id = mp.id
+                WHERE p.master_product_id = $1 -- Match by master ID
+                  AND p.id != $2               -- Exclude the original product itself
+                  AND s.is_active = TRUE;      -- Only from active suppliers!
+            `;
+            const alternativesResult = await db.query(alternativesQuery, [masterProductId, parsedProductId]);
+            
+            // Calculate effective price for each alternative
+            alternatives = alternativesResult.rows.map(alt => {
+                let altBasePrice = parseFloat(alt.supplier_base_price);
+                if (alt.supplier_is_on_sale && alt.supplier_discount_price !== null) {
+                    altBasePrice = parseFloat(alt.supplier_discount_price);
+                }
+                const altAdjustment = parseFloat(alt.price_adjustment_percentage);
+                const altEffectivePrice = altBasePrice * (1 + altAdjustment);
+
+                return {
+                    id: alt.id,
+                    name: alt.master_product_display_name || alt.name,
+                    image_url: alt.master_product_image_url || alt.image_url,
+                    supplier_id: alt.supplier_id,
+                    supplier_name: alt.supplier_name,
+                    effective_selling_price: parseFloat(altEffectivePrice.toFixed(2)),
+                };
+            });
+        }
+
+        console.log(`[FAVORITE_DETAILS] Found ${alternatives.length} alternatives for product ${parsedProductId}`);
+
+        // Step 3: Construct the final response object for the frontend.
+        res.status(200).json({
+            originalProduct: originalProduct,
+            isAvailable: isOriginalAvailable,
+            alternatives: alternatives
+        });
+
+    } catch (err) {
+        console.error(`[FAVORITE_DETAILS] Error fetching details for product ${parsedProductId}:`, err);
+        res.status(500).json({ error: 'Failed to fetch product details and alternatives' });
+    }
+});
+
 // --- Cron Job Scheduling ---
 // Example: Run every hour at the 0th minute.
 // For testing, you might use '*/1 * * * *' (every minute) - BE CAREFUL with frequent DB updates.
