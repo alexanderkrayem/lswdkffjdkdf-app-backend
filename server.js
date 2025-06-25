@@ -737,63 +737,101 @@ app.get('/api/user/profile', async (req, res) => {
 // POST (Create or Update) user profile
 // Expects profile data in request body: { userId, fullName, phoneNumber, addressLine1, addressLine2, city }
 // [CITY_FILTER] UPDATED POST (Create or Update) user profile
+// In server.js
+
+// [CITY_FILTER] REVISED AND MORE ROBUST POST (Create or Update) user profile
 app.post('/api/user/profile', async (req, res) => {
-  const { userId } = req.body;
+    const { userId } = req.body;
 
-  if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
-  }
+    if (!userId) {
+        return res.status(400).json({ error: 'User ID is required' });
+    }
 
-  // Dynamically build the SET part of the query
-  const fieldsToUpdate = {};
-  if (req.body.fullName !== undefined) fieldsToUpdate.full_name = req.body.fullName;
-  if (req.body.phoneNumber !== undefined) fieldsToUpdate.phone_number = req.body.phoneNumber;
-  if (req.body.addressLine1 !== undefined) fieldsToUpdate.address_line1 = req.body.addressLine1;
-  if (req.body.addressLine2 !== undefined) fieldsToUpdate.address_line2 = req.body.addressLine2;
-  if (req.body.city !== undefined) fieldsToUpdate.city = req.body.city;
-  if (req.body.selected_city_id !== undefined) fieldsToUpdate.selected_city_id = req.body.selected_city_id;
+    const client = await db.pool.connect(); // Use a client for transaction
+    try {
+        await client.query('BEGIN');
 
-  if (Object.keys(fieldsToUpdate).length === 0) {
-      return res.status(400).json({ error: 'No fields provided for update.' });
-  }
+        // Check if a profile already exists for this user.
+        const existingProfileResult = await client.query('SELECT user_id FROM user_profiles WHERE user_id = $1', [userId]);
+        const profileExists = existingProfileResult.rows.length > 0;
 
-  const setClauses = Object.keys(fieldsToUpdate).map((key, index) => `${key} = $${index + 2}`).join(', ');
-  const values = [userId, ...Object.values(fieldsToUpdate)];
+        let query;
+        let values = [];
 
-  try {
-      // A more robust UPSERT query
-      const query = `
-          INSERT INTO user_profiles (user_id, ${Object.keys(fieldsToUpdate).join(', ')})
-          VALUES ($1, ${Object.values(fieldsToUpdate).map((_, i) => `$${i + 2}`).join(', ')})
-          ON CONFLICT (user_id)
-          DO UPDATE SET
-              ${setClauses},
-              updated_at = NOW()
-          RETURNING 
-              user_id, full_name, phone_number, address_line1, address_line2, city, selected_city_id;
-      `;
-      
-      const result = await db.query(query, values);
+        if (profileExists) {
+            // --- UPDATE an existing profile ---
+            const fieldsToUpdate = {};
+            // Build an object of fields to update from the request body
+            if (req.body.fullName !== undefined) fieldsToUpdate.full_name = req.body.fullName;
+            if (req.body.phoneNumber !== undefined) fieldsToUpdate.phone_number = req.body.phoneNumber;
+            if (req.body.addressLine1 !== undefined) fieldsToUpdate.address_line1 = req.body.addressLine1;
+            if (req.body.addressLine2 !== undefined) fieldsToUpdate.address_line2 = req.body.addressLine2;
+            if (req.body.city !== undefined) fieldsToUpdate.city = req.body.city;
+            if (req.body.selected_city_id !== undefined) fieldsToUpdate.selected_city_id = req.body.selected_city_id;
 
-      // We still need to fetch the city name after an update
-      const updatedProfile = result.rows[0];
-      if (updatedProfile.selected_city_id) {
-          const cityResult = await db.query('SELECT name FROM cities WHERE id = $1', [updatedProfile.selected_city_id]);
-          updatedProfile.selected_city_name = cityResult.rows[0]?.name || null;
-      } else {
-          updatedProfile.selected_city_name = null;
-      }
+            if (Object.keys(fieldsToUpdate).length === 0) {
+                // If nothing to update, just fetch and return current profile
+                const currentProfile = await client.query('SELECT * FROM user_profiles WHERE user_id = $1', [userId]);
+                await client.query('COMMIT');
+                client.release();
+                return res.status(200).json(currentProfile.rows[0]);
+            }
+            
+            fieldsToUpdate.updated_at = new Date(); // Manually set update timestamp
 
-      res.status(200).json(updatedProfile); // Send back the complete, updated profile
+            const setClauses = Object.keys(fieldsToUpdate).map((key, index) => `${key} = $${index + 1}`).join(', ');
+            values = [...Object.values(fieldsToUpdate), userId];
 
-  } catch (err) {
-      console.error(`Error creating/updating profile for user ${userId}:`, err);
-      // Add a check for foreign key violation in case an invalid city_id is sent
-      if (err.code === '23503') { // Foreign key violation
-          return res.status(400).json({ error: 'Invalid selected_city_id. This city does not exist.' });
-      }
-      res.status(500).json({ error: 'Failed to save user profile' });
-  }
+            query = `
+                UPDATE user_profiles
+                SET ${setClauses}
+                WHERE user_id = $${values.length}
+                RETURNING *;
+            `;
+        } else {
+            // --- INSERT a new profile ---
+            // A new profile might only contain userId and selected_city_id
+            const {
+                fullName = null,
+                phoneNumber = null,
+                addressLine1 = null,
+                addressLine2 = null,
+                city = null,
+                selected_city_id = null
+            } = req.body;
+            
+            query = `
+                INSERT INTO user_profiles (user_id, full_name, phone_number, address_line1, address_line2, city, selected_city_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING *;
+            `;
+            values = [userId, fullName, phoneNumber, addressLine1, addressLine2, city, selected_city_id];
+        }
+
+        const result = await client.query(query, values);
+        const updatedProfile = result.rows[0];
+
+        // Fetch the city name to return a complete profile object to the frontend
+        if (updatedProfile.selected_city_id) {
+            const cityResult = await client.query('SELECT name FROM cities WHERE id = $1', [updatedProfile.selected_city_id]);
+            updatedProfile.selected_city_name = cityResult.rows[0]?.name || null;
+        } else {
+            updatedProfile.selected_city_name = null;
+        }
+
+        await client.query('COMMIT');
+        res.status(200).json(updatedProfile);
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(`[PROFILE_SAVE_ERROR] for user ${userId}:`, err);
+        if (err.code === '23503') { // Foreign key violation
+            return res.status(400).json({ error: 'Invalid selected_city_id. This city does not exist.' });
+        }
+        res.status(500).json({ error: 'Failed to save user profile.' });
+    } finally {
+        if (client) client.release();
+    }
 });
 
 
