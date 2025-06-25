@@ -1735,18 +1735,12 @@ app.delete('/api/favorites/:productId', async (req, res) => {
 
 // [CITY_FILTER] UPDATED GET featured items with city filtering
 app.get('/api/featured-items', async (req, res) => {
-    const cityId = parseInt(req.query.cityId, 10); // <-- [CITY_FILTER] Get cityId from query
     const SLIDER_ITEM_LIMIT = 5;
-
-    // [CITY_FILTER] cityId is now a mandatory parameter
-    if (!cityId) {
-        return res.status(400).json({ error: "A cityId query parameter is required." });
-    }
-
-    console.log(`[FEATURED_API_V4] Fetching up to ${SLIDER_ITEM_LIMIT} featured items for cityId ${cityId}.`);
+    console.log(`[FEATURED_API_V3] Fetching up to ${SLIDER_ITEM_LIMIT} featured items.`);
 
     try {
-        // [CITY_FILTER] The main query is now significantly updated to filter by city.
+        // Step 1: Get active feature definitions, already filtering by supplier status where possible
+        // This query is now more complex to pre-filter based on supplier activity.
         const featuredDefinitionsQuery = `
             SELECT 
                 fi.id AS feature_definition_id,
@@ -1756,46 +1750,38 @@ app.get('/api/featured-items', async (req, res) => {
                 fi.custom_description, 
                 fi.custom_image_url
             FROM featured_items fi
-            -- We need to join to suppliers based on the item_type to check their serviceable cities.
             LEFT JOIN products p_check ON fi.item_type = 'product' AND fi.item_id = p_check.id
+            LEFT JOIN suppliers s_prod_check ON p_check.supplier_id = s_prod_check.id
+            LEFT JOIN suppliers s_supp_check ON fi.item_type = 'supplier' AND fi.item_id = s_supp_check.id
             LEFT JOIN deals d_check ON fi.item_type = 'deal' AND fi.item_id = d_check.id
-            -- This join links a featured item to its supplier, regardless of type
-            LEFT JOIN suppliers s_check ON 
-                (fi.item_type = 'supplier' AND fi.item_id = s_check.id) OR
-                (fi.item_type = 'product' AND p_check.supplier_id = s_check.id) OR
-                (fi.item_type = 'deal' AND d_check.supplier_id = s_check.id)
-            -- This join checks if the linked supplier serves the target city
-            LEFT JOIN supplier_cities sc ON s_check.id = sc.supplier_id AND sc.city_id = $1
-
-            WHERE 
-                fi.is_active = TRUE
-                AND (fi.active_from IS NULL OR fi.active_from <= NOW())
-                AND (fi.active_until IS NULL OR fi.active_until >= NOW())
-                AND (
-                    -- Condition 1: The item is a platform-wide deal (no supplier)
-                    (fi.item_type = 'deal' AND d_check.supplier_id IS NULL)
-                    OR
-                    -- Condition 2: The item's supplier is active AND serves the selected city.
-                    -- The LEFT JOIN to supplier_cities will result in sc.city_id being non-null only if there's a match.
-                    (s_check.is_active = TRUE AND sc.city_id IS NOT NULL)
-                )
+            LEFT JOIN suppliers s_deal_check ON d_check.supplier_id = s_deal_check.id
+            WHERE fi.is_active = TRUE
+              AND (fi.active_from IS NULL OR fi.active_from <= NOW())
+              AND (fi.active_until IS NULL OR fi.active_until >= NOW())
+              AND (
+                    (fi.item_type = 'product' AND s_prod_check.is_active = TRUE) OR
+                    (fi.item_type = 'supplier' AND s_supp_check.is_active = TRUE) OR
+                    (fi.item_type = 'deal' AND (d_check.supplier_id IS NULL OR s_deal_check.is_active = TRUE)) OR
+                    (fi.item_type NOT IN ('product', 'supplier', 'deal')) -- For any other types not supplier-dependent
+                  )
             ORDER BY fi.display_order ASC, fi.created_at DESC
-            LIMIT $2;
+            LIMIT $1;
         `;
-        
-        const featuredDefsResult = await db.query(featuredDefinitionsQuery, [cityId, SLIDER_ITEM_LIMIT]);
+        const featuredDefsResult = await db.query(featuredDefinitionsQuery, [SLIDER_ITEM_LIMIT]);
         const featureDefinitions = featuredDefsResult.rows;
 
-        console.log(`[FEATURED_API_V4] Found ${featureDefinitions.length} active feature definitions for cityId ${cityId}.`);
+        console.log(`[FEATURED_API_V3] Found ${featureDefinitions.length} active feature definitions after initial supplier status filter.`);
 
         if (featureDefinitions.length === 0) {
             return res.json([]);
         }
 
-        // --- Step 2: Hydration ---
-        // Your existing hydration logic does not need to be changed, as the list of
-        // featureDefinitions is now already correctly pre-filtered by location.
+        // Step 2: Hydration (same as before, but the input list is already pre-filtered)
         const hydrationPromises = featureDefinitions.map(async (definition) => {
+            // ... (keep your existing hydration logic from the last version of this endpoint)
+            // It will fetch details for product, deal, or supplier based on item_type
+            // The items it tries to hydrate are already confirmed to be from active suppliers (or platform deals/items)
+            // if they were product, supplier, or supplier-linked deal types.
             let title = definition.custom_title;
             let description = definition.custom_description;
             let imageUrl = definition.custom_image_url;
@@ -1804,22 +1790,59 @@ app.get('/api/featured-items', async (req, res) => {
 
             if (needsHydration) {
                 try {
-                    // ... (Your existing hydration logic for product, deal, supplier) ...
-                    // This block remains exactly the same as you provided.
-                    // For example:
+                    let originalItemResult;
                     if (definition.item_type === 'product') {
-                        // ... fetch product details ...
+                        // Fetch supplier's base price, discount, sale status, and master adjustment
+                const productDetailQuery = `
+                    SELECT 
+                        p.name, p.description, p.image_url, 
+                        p.price AS supplier_base_price, 
+                        p.discount_price AS supplier_discount_price, 
+                        p.is_on_sale AS supplier_is_on_sale,
+                        COALESCE(mp.current_price_adjustment_percentage, 0.0000) AS price_adjustment_percentage,
+                        mp.display_name AS master_product_display_name,
+                        mp.image_url AS master_product_image_url
+                    FROM products p
+                    LEFT JOIN master_products mp ON p.master_product_id = mp.id
+                    WHERE p.id = $1; 
+                `;
+                // Note: The initial featuredDefinitionsQuery already ensures p.supplier_id links to an active supplier.
+                       originalItemResult = await db.query(productDetailQuery, [definition.item_id]);
+
+                if (originalItemResult.rows.length > 0) { 
+                    const p_orig = originalItemResult.rows[0];
+                    title = title || (p_orig.master_product_display_name || p_orig.name);
+                    description = description || p_orig.description; // Or master_product_description
+                    imageUrl = imageUrl || (p_orig.master_product_image_url || p_orig.image_url);
+                     let basePriceForCalc = parseFloat(p_orig.supplier_base_price);
+                    if (p_orig.supplier_is_on_sale && p_orig.supplier_discount_price !== null) {
+                        basePriceForCalc = parseFloat(p_orig.supplier_discount_price);
+                    }
+                    const adjustment = parseFloat(p_orig.price_adjustment_percentage);
+                    const effectivePrice = basePriceForCalc * (1 + adjustment);
+
+                    originalItemData = { 
+                        effective_selling_price: parseFloat(effectivePrice.toFixed(2)),
+                        // You might want to include original_price if different for display ("Was X, Now Y")
+                        // original_price: parseFloat(p_orig.supplier_base_price).toFixed(2), 
+                        is_on_sale: p_orig.supplier_is_on_sale // Or a more complex logic if effective price < supplier base
+                    };
+                     }
                     } else if (definition.item_type === 'deal') {
-                        // ... fetch deal details ...
-                    } // etc.
+                        originalItemResult = await db.query('SELECT title, description, image_url, discount_percentage, end_date FROM deals WHERE id = $1', [definition.item_id]);
+                        if (originalItemResult.rows.length > 0) { const d = originalItemResult.rows[0]; title = title || d.title; description = description || d.description; imageUrl = imageUrl || d.image_url; originalItemData = { discount_percentage: d.discount_percentage, end_date: d.end_date };}
+                    } else if (definition.item_type === 'supplier') {
+                        originalItemResult = await db.query('SELECT name, category, image_url, rating, location FROM suppliers WHERE id = $1', [definition.item_id]);
+                        if (originalItemResult.rows.length > 0) { const s = originalItemResult.rows[0]; title = title || s.name; description = description || s.category; imageUrl = imageUrl || s.image_url; originalItemData = { rating: s.rating, location: s.location };}
+                    }
                 } catch (hydrationError) {
-                    console.error(`[FEATURED_API] Hydration error for item_id ${definition.item_id}:`, hydrationError.message);
-                    return { ...definition, hydrationError: true };
+                    console.error(`[FEATURED_API_V3] Hydration error for item_id ${definition.item_id} (type ${definition.item_type}):`, hydrationError.message);
+                    return { ...definition, title: definition.custom_title || 'Error Loading', hydrationError: true };
                 }
             }
             
             if (!title) {
-                console.warn(`[FEATURED_API] Item type=${definition.item_type}, id=${definition.item_id} has no title. Skipping.`);
+                console.warn(`[FEATURED_API_V3] Item type=${definition.item_type}, id=${definition.item_id} has no title. Skipping.`);
                 return null; 
             }
             return {
@@ -1831,14 +1854,16 @@ app.get('/api/featured-items', async (req, res) => {
         const hydratedItems = await Promise.all(hydrationPromises);
         const finalValidItems = hydratedItems.filter(item => item !== null && !item.hydrationError);
 
-        console.log(`[FEATURED_API_V4] Sending ${finalValidItems.length} items to client for cityId ${cityId}.`);
+        console.log(`[FEATURED_API_V3] Sending ${finalValidItems.length} items to client.`);
+        console.log("[FEATURED_API_V3] Data being sent:", JSON.stringify(finalValidItems, null, 2));
         res.json(finalValidItems);
 
     } catch (err) {
-        console.error(`[FEATURED_API] General error in /api/featured-items for cityId ${cityId}:`, err);
+        console.error("[FEATURED_API_V3] General error in /api/featured-items:", err);
         res.status(500).json({ error: 'Failed to fetch featured items' });
     }
 });
+
 
 // ... (app.listen) ...
 // server.js
