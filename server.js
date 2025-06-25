@@ -743,6 +743,9 @@ app.get('/api/user/profile', async (req, res) => {
 // In server.js
 
 // [CITY_FILTER] REVISED v3 POST (Create or Update) user profile
+// In server.js
+
+// [CITY_FILTER] REVISED v4 POST (Create or Update) user profile
 app.post('/api/user/profile', async (req, res) => {
     const { userId } = req.body;
 
@@ -773,41 +776,56 @@ app.post('/api/user/profile', async (req, res) => {
             if (req.body.selected_city_id !== undefined) fieldsToUpdate.selected_city_id = req.body.selected_city_id;
 
             if (Object.keys(fieldsToUpdate).length === 0) {
+                const currentProfile = await client.query('SELECT * FROM user_profiles WHERE user_id = $1', [userId]);
                 await client.query('COMMIT');
                 client.release();
-                return res.status(200).json(existingProfileResult.rows[0]);
+                return res.status(200).json(currentProfile.rows[0]);
             }
             
             fieldsToUpdate.updated_at = new Date();
-
             const setClauses = Object.keys(fieldsToUpdate).map((key, index) => `${key} = $${index + 1}`).join(', ');
             values = [...Object.values(fieldsToUpdate), userId];
-
             query = `UPDATE user_profiles SET ${setClauses} WHERE user_id = $${values.length} RETURNING *;`;
             console.log(`[PROFILE_SAVE] Updating existing profile for user ${userId}.`);
 
         } else {
-            // --- INSERT Logic ---
-            // ==========================================================
-            // THE FIX IS HERE: Use the correct camelCase variable names
-            // from req.body and provide defaults.
-            // ==========================================================
+            // --- INSERT Logic (The Corrected Part) ---
+            // When creating a new profile, especially from the city modal,
+            // we must provide default values for any NOT NULL text columns.
             const {
-                fullName = null,
-                phoneNumber = null,
-                addressLine1 = null,
-                addressLine2 = null,
-                city = null,
+                fullName = 'New User', // Provide a default name
+                phoneNumber = '',     // Default to empty string
+                addressLine1 = '',    // Default to empty string instead of NULL
+                addressLine2 = null,    // This can be null if your DB allows it
+                city = '',            // Default to empty string
                 selected_city_id = null
             } = req.body;
+
+            // Ensure that if a full form is submitted, the required fields are not empty
+            // This logic is more for the final checkout save, but good to have here.
+            if (req.body.addressLine1 !== undefined && !req.body.addressLine1) {
+                 throw new Error("Address Line 1 cannot be empty when provided.");
+            }
+            if (req.body.city !== undefined && !req.body.city) {
+                 throw new Error("City cannot be empty when provided.");
+            }
+
 
             query = `
                 INSERT INTO user_profiles (user_id, full_name, phone_number, address_line1, address_line2, city, selected_city_id)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING *;
             `;
-            // Use the variables destructured from req.body directly
-            values = [userId, fullName, phoneNumber, addressLine1, addressLine2, city, selected_city_id];
+            // For the initial city selection, we use the defaults for address fields
+            values = [
+                userId, 
+                req.body.fullName || fullName,
+                req.body.phoneNumber || phoneNumber,
+                req.body.addressLine1 || addressLine1,
+                req.body.addressLine2 || addressLine2,
+                req.body.city || city,
+                req.body.selected_city_id || selected_city_id
+            ];
             console.log(`[PROFILE_SAVE] Inserting new profile for user ${userId}.`);
         }
         
@@ -830,7 +848,6 @@ app.post('/api/user/profile', async (req, res) => {
 
     } catch (err) {
         await client.query('ROLLBACK');
-        // This log is now the most important thing to check if it fails again
         console.error(`[PROFILE_SAVE_ERROR] for user ${userId}:`, err);
         if (err.code === '23503') {
             return res.status(400).json({ error: 'Invalid selected_city_id. This city does not exist.' });
