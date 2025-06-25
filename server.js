@@ -740,28 +740,31 @@ app.get('/api/user/profile', async (req, res) => {
 // In server.js
 
 // [CITY_FILTER] REVISED AND MORE ROBUST POST (Create or Update) user profile
+// In server.js
+
+// [CITY_FILTER] REVISED v3 POST (Create or Update) user profile
 app.post('/api/user/profile', async (req, res) => {
     const { userId } = req.body;
 
     if (!userId) {
         return res.status(400).json({ error: 'User ID is required' });
     }
+    
+    console.log(`[PROFILE_SAVE] Received request for user ${userId} with body:`, req.body);
 
-    const client = await db.pool.connect(); // Use a client for transaction
+    const client = await db.pool.connect();
     try {
         await client.query('BEGIN');
 
-        // Check if a profile already exists for this user.
         const existingProfileResult = await client.query('SELECT user_id FROM user_profiles WHERE user_id = $1', [userId]);
         const profileExists = existingProfileResult.rows.length > 0;
 
         let query;
-        let values = [];
+        let values;
 
         if (profileExists) {
-            // --- UPDATE an existing profile ---
+            // --- UPDATE Logic ---
             const fieldsToUpdate = {};
-            // Build an object of fields to update from the request body
             if (req.body.fullName !== undefined) fieldsToUpdate.full_name = req.body.fullName;
             if (req.body.phoneNumber !== undefined) fieldsToUpdate.phone_number = req.body.phoneNumber;
             if (req.body.addressLine1 !== undefined) fieldsToUpdate.address_line1 = req.body.addressLine1;
@@ -770,27 +773,25 @@ app.post('/api/user/profile', async (req, res) => {
             if (req.body.selected_city_id !== undefined) fieldsToUpdate.selected_city_id = req.body.selected_city_id;
 
             if (Object.keys(fieldsToUpdate).length === 0) {
-                // If nothing to update, just fetch and return current profile
-                const currentProfile = await client.query('SELECT * FROM user_profiles WHERE user_id = $1', [userId]);
                 await client.query('COMMIT');
                 client.release();
-                return res.status(200).json(currentProfile.rows[0]);
+                return res.status(200).json(existingProfileResult.rows[0]);
             }
             
-            fieldsToUpdate.updated_at = new Date(); // Manually set update timestamp
+            fieldsToUpdate.updated_at = new Date();
 
             const setClauses = Object.keys(fieldsToUpdate).map((key, index) => `${key} = $${index + 1}`).join(', ');
             values = [...Object.values(fieldsToUpdate), userId];
 
-            query = `
-                UPDATE user_profiles
-                SET ${setClauses}
-                WHERE user_id = $${values.length}
-                RETURNING *;
-            `;
+            query = `UPDATE user_profiles SET ${setClauses} WHERE user_id = $${values.length} RETURNING *;`;
+            console.log(`[PROFILE_SAVE] Updating existing profile for user ${userId}.`);
+
         } else {
-            // --- INSERT a new profile ---
-            // A new profile might only contain userId and selected_city_id
+            // --- INSERT Logic ---
+            // ==========================================================
+            // THE FIX IS HERE: Use the correct camelCase variable names
+            // from req.body and provide defaults.
+            // ==========================================================
             const {
                 fullName = null,
                 phoneNumber = null,
@@ -799,19 +800,23 @@ app.post('/api/user/profile', async (req, res) => {
                 city = null,
                 selected_city_id = null
             } = req.body;
-            
+
             query = `
                 INSERT INTO user_profiles (user_id, full_name, phone_number, address_line1, address_line2, city, selected_city_id)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING *;
             `;
+            // Use the variables destructured from req.body directly
             values = [userId, fullName, phoneNumber, addressLine1, addressLine2, city, selected_city_id];
+            console.log(`[PROFILE_SAVE] Inserting new profile for user ${userId}.`);
         }
+        
+        console.log('[PROFILE_SAVE] Executing query:', query);
+        console.log('[PROFILE_SAVE] With values:', values);
 
         const result = await client.query(query, values);
         const updatedProfile = result.rows[0];
 
-        // Fetch the city name to return a complete profile object to the frontend
         if (updatedProfile.selected_city_id) {
             const cityResult = await client.query('SELECT name FROM cities WHERE id = $1', [updatedProfile.selected_city_id]);
             updatedProfile.selected_city_name = cityResult.rows[0]?.name || null;
@@ -820,12 +825,14 @@ app.post('/api/user/profile', async (req, res) => {
         }
 
         await client.query('COMMIT');
+        console.log(`[PROFILE_SAVE] Successfully saved profile for user ${userId}.`);
         res.status(200).json(updatedProfile);
 
     } catch (err) {
         await client.query('ROLLBACK');
+        // This log is now the most important thing to check if it fails again
         console.error(`[PROFILE_SAVE_ERROR] for user ${userId}:`, err);
-        if (err.code === '23503') { // Foreign key violation
+        if (err.code === '23503') {
             return res.status(400).json({ error: 'Invalid selected_city_id. This city does not exist.' });
         }
         res.status(500).json({ error: 'Failed to save user profile.' });
