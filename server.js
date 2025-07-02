@@ -102,10 +102,8 @@ app.get('/api/search', async (req, res) => {
 
     try {
         const productPromise = (async () => {
-            // --- Product Search with Corrected Parameter Order ---
             const queryParams = [];
-            let paramCount = 0;
-
+            // This SQL query is now more comprehensive to fetch the adjustment percentage
             const productsQuery = `
                 SELECT
                     p.id, p.name, p.description, p.price AS supplier_base_price, 
@@ -113,18 +111,19 @@ app.get('/api/search', async (req, res) => {
                     p.category, p.image_url, s_prod.name as supplier_name, p.supplier_id,
                     p.master_product_id, mp.display_name AS master_product_display_name,
                     mp.image_url AS master_product_image_url,
+                    COALESCE(mp.current_price_adjustment_percentage, 0.0000) AS price_adjustment_percentage,
                     ts_rank_cd(p.tsv, q.query) AS rank
                 FROM products p
                 JOIN suppliers s_prod ON p.supplier_id = s_prod.id
                 JOIN supplier_cities sc ON s_prod.id = sc.supplier_id
                 LEFT JOIN master_products mp ON p.master_product_id = mp.id
-                , LATERAL websearch_to_tsquery('pg_catalog.arabic', $${paramCount + 1}) AS q(query) -- Parameter 1: Search Term
+                , LATERAL websearch_to_tsquery('pg_catalog.arabic', $1) AS q(query) -- Parameter 1: Search Term
                 WHERE 
                     s_prod.is_active = TRUE
-                    AND sc.city_id = $${paramCount + 2} -- Parameter 2: City ID
-                    AND (p.tsv @@ q.query OR similarity(COALESCE(mp.display_name, p.name), $${paramCount + 1}) > $${paramCount + 3}) -- Parameter 1 & 3
+                    AND sc.city_id = $2 -- Parameter 2: City ID
+                    AND (p.tsv @@ q.query OR similarity(COALESCE(mp.display_name, p.name), $1) > $3) -- Parameter 1 & 3
                 ORDER BY rank DESC
-                LIMIT $${paramCount + 4} OFFSET $${paramCount + 5}; -- Parameter 4 & 5
+                LIMIT $4 OFFSET $5; -- Parameter 4 & 5
             `;
             queryParams.push(trimmedSearchTerm, cityId, trigramThreshold, productLimit, productOffset);
 
@@ -134,20 +133,43 @@ app.get('/api/search', async (req, res) => {
                 JOIN suppliers s_prod ON p.supplier_id = s_prod.id
                 JOIN supplier_cities sc ON s_prod.id = sc.supplier_id
                 LEFT JOIN master_products mp ON p.master_product_id = mp.id
-                , LATERAL websearch_to_tsquery('pg_catalog.arabic', $1) AS q(query) -- Param 1
+                , LATERAL websearch_to_tsquery('pg_catalog.arabic', $1) AS q(query)
                 WHERE 
                     s_prod.is_active = TRUE
-                    AND sc.city_id = $2 -- Param 2
-                    AND (p.tsv @@ q.query OR similarity(COALESCE(mp.display_name, p.name), $1) > $3); -- Param 1 & 3
+                    AND sc.city_id = $2
+                    AND (p.tsv @@ q.query OR similarity(COALESCE(mp.display_name, p.name), $1) > $3);
             `;
             const countQueryParams = [trimmedSearchTerm, cityId, trigramThreshold];
             
-            const productsResult = await db.query(productsQuery, queryParams);
-            const productCountResult = await db.query(countQuery, countQueryParams);
+            const [productsResult, productCountResult] = await Promise.all([
+                db.query(productsQuery, queryParams),
+                db.query(countQuery, countQueryParams)
+            ]);
             
+            // =================================================================
+            // === THIS IS THE CORRECTED MAPPING LOGIC WITH PRICE CALCULATION ===
+            // =================================================================
             const processedProducts = productsResult.rows.map(p => {
-                // Your existing price calculation logic here
-                return { id: p.id, name: p.master_product_display_name || p.name, /* ...other fields */ };
+                // Calculate the effective selling price
+                let basePriceForCalc = parseFloat(p.supplier_base_price);
+                if (p.supplier_is_on_sale && p.supplier_discount_price !== null) {
+                    basePriceForCalc = parseFloat(p.supplier_discount_price);
+                }
+                const adjustment = parseFloat(p.price_adjustment_percentage);
+                const effectivePrice = basePriceForCalc * (1 + adjustment);
+
+                // Return the final object shape that the frontend card expects
+                return {
+                    id: p.id,
+                    name: p.master_product_display_name || p.name,
+                    image_url: p.master_product_image_url || p.image_url,
+                    supplier_name: p.supplier_name,
+                    supplier_id: p.supplier_id,
+                    effective_selling_price: parseFloat(effectivePrice.toFixed(2)),
+                    // These fields are needed to show a "slashed" original price on the card
+                    is_on_sale: p.supplier_is_on_sale,
+                    discount_price: p.supplier_discount_price,
+                };
             });
 
             return {
@@ -158,7 +180,7 @@ app.get('/api/search', async (req, res) => {
             };
         })();
 
-        // The rest of your Promise.all logic for deals and suppliers remains the same...
+        // Your existing logic for deals and suppliers
         const dealsPromise = (async () => { /* ... */ })();
         const suppliersPromise = (async () => { /* ... */ })();
 
